@@ -24,6 +24,8 @@
 #include <grp.h>
 #include <sys/prctl.h>
 #include <signal.h>
+#include <poll.h>
+#include <stdarg.h>
 #ifdef HAVE_RANDOMX
 #include <randomx.h>
 #endif
@@ -57,6 +59,12 @@ typedef struct {
     uint32_t rx_height;
 #endif
     volatile int canceled;
+    // Extended format fields (when blob_len > 0)
+    unsigned char *blob;
+    uint32_t blob_len;
+    uint32_t nonce_off;
+    uint8_t nonce_size; // 4 or 8
+    uint64_t target64; // optional 64-bit target threshold (XMRig-style)
 } job_t;
 
 // Phase 2: simple token-based auth (mTLS scaffolding behind HAVE_OPENSSL)
@@ -96,6 +104,91 @@ typedef struct {
     size_t prefetch_len;
     size_t prefetch_off;
 } conn_ctx_t;
+
+// ---- Observability ----
+#define LOG_ERROR 0
+#define LOG_INFO  1
+#define LOG_DEBUG 2
+static int g_log_level = LOG_INFO;
+static int g_stats_interval_sec = 30;
+
+static volatile uint64_t g_ctr_frames_in = 0;
+static volatile uint64_t g_ctr_frames_out = 0;
+static volatile uint64_t g_ctr_errors = 0;
+static volatile uint64_t g_ctr_jobs_enq = 0;
+static volatile uint64_t g_ctr_jobs_drop = 0;
+static volatile uint64_t g_ctr_results = 0;
+static volatile uint64_t g_ctr_done = 0;
+static volatile uint64_t g_ctr_pings = 0;
+static volatile uint64_t g_ctr_pongs = 0;
+static volatile uint64_t g_ctr_hellos = 0;
+static volatile uint64_t g_ctr_server_hello = 0;
+static volatile uint64_t g_ctr_tls_accepts = 0;
+static volatile uint64_t g_ctr_tls_errors = 0;
+
+static void log_emit(int lvl, const char *fmt, ...)
+{
+    if (lvl > g_log_level) return;
+    const char *lv = (lvl==LOG_DEBUG?"DEBUG":(lvl==LOG_INFO?"INFO":"ERROR"));
+    struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
+    char buf[64];
+    struct tm tm; time_t sec = ts.tv_sec; localtime_r(&sec, &tm);
+    strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &tm);
+    fprintf(stderr, "%s.%03ld %s: ", buf, ts.tv_nsec/1000000, lv);
+    va_list ap; va_start(ap, fmt); vfprintf(stderr, fmt, ap); va_end(ap);
+    fputc('\n', stderr);
+}
+
+static void* stats_thread(void *arg)
+{
+    (void)arg;
+    for(;;){
+        sleep(g_stats_interval_sec > 0 ? g_stats_interval_sec : 30);
+        uint64_t in  = __sync_add_and_fetch(&g_ctr_frames_in, 0);
+        uint64_t out = __sync_add_and_fetch(&g_ctr_frames_out, 0);
+        uint64_t err = __sync_add_and_fetch(&g_ctr_errors, 0);
+        uint64_t enq = __sync_add_and_fetch(&g_ctr_jobs_enq, 0);
+        uint64_t drp = __sync_add_and_fetch(&g_ctr_jobs_drop, 0);
+        uint64_t res = __sync_add_and_fetch(&g_ctr_results, 0);
+        uint64_t don = __sync_add_and_fetch(&g_ctr_done, 0);
+        uint64_t png = __sync_add_and_fetch(&g_ctr_pings, 0);
+        uint64_t png2= __sync_add_and_fetch(&g_ctr_pongs, 0);
+        uint64_t hlo = __sync_add_and_fetch(&g_ctr_hellos, 0);
+        uint64_t shl = __sync_add_and_fetch(&g_ctr_server_hello, 0);
+        uint64_t tacc= __sync_add_and_fetch(&g_ctr_tls_accepts, 0);
+        uint64_t terr= __sync_add_and_fetch(&g_ctr_tls_errors, 0);
+        log_emit(LOG_INFO, "stats frames[in=%" PRIu64 ",out=%" PRIu64 "] errors=%" PRIu64 ", jobs[enq=%" PRIu64 ",drop=%" PRIu64 "] results=%" PRIu64 ", done=%" PRIu64 ", ping=%" PRIu64 ", pong=%" PRIu64 ", hello=%" PRIu64 ", server_hello=%" PRIu64 ", tls[ok=%" PRIu64 ",err=%" PRIu64 "]",
+                 in, out, err, enq, drp, res, don, png, png2, hlo, shl, tacc, terr);
+    }
+    return NULL;
+}
+
+// ---- TLS I/O hardening ----
+#ifdef HAVE_OPENSSL
+static int wait_fd_ready(int fd, int want_write, int timeout_ms)
+{
+    struct pollfd p = { .fd = fd, .events = (short)(want_write ? POLLOUT : POLLIN), .revents = 0 };
+    int r = poll(&p, 1, timeout_ms);
+    return (r > 0) ? 0 : -1;
+}
+
+static int ssl_accept_with_timeout(SSL *ssl, int fd, int timeout_ms)
+{
+    struct timespec ts0; clock_gettime(CLOCK_MONOTONIC, &ts0);
+    for(;;){
+        int r = SSL_accept(ssl);
+        if (r == 1) return 0;
+        int e = SSL_get_error(ssl, r);
+        struct timespec ts1; clock_gettime(CLOCK_MONOTONIC, &ts1);
+        long elapsed_ms = (long)((ts1.tv_sec - ts0.tv_sec)*1000 + (ts1.tv_nsec - ts0.tv_nsec)/1000000);
+        if (elapsed_ms >= timeout_ms) return -1;
+        int remain = timeout_ms - (int)elapsed_ms;
+        if (e == SSL_ERROR_WANT_READ) { if (wait_fd_ready(fd, 0, remain) != 0) return -1; continue; }
+        if (e == SSL_ERROR_WANT_WRITE){ if (wait_fd_ready(fd, 1, remain) != 0) return -1; continue; }
+        return -1;
+    }
+}
+#endif
 
 // 32-bit byte swap with inline assembly where available
 static inline uint32_t bswap32_asm(uint32_t x)
@@ -329,6 +422,26 @@ static int hash_randomx(const unsigned char *header, size_t header_len, uint64_t
     return 0;
 }
 
+static int hash_randomx_data(const unsigned char *input, size_t len, unsigned char out32[32])
+{
+    static __thread randomx_vm *vm = NULL;
+    static __thread uint64_t tls_seed_ver = 0;
+
+    if (!vm || tls_seed_ver != g_rx_seed_ver) {
+        if (vm) { randomx_destroy_vm(vm); vm = NULL; }
+        pthread_mutex_lock(&rx_lock);
+        randomx_cache *cache = g_rx_cache;
+        if (cache) {
+            vm = randomx_create_vm(RANDOMX_FLAG_JIT, cache, NULL);
+            tls_seed_ver = g_rx_seed_ver;
+        }
+        pthread_mutex_unlock(&rx_lock);
+        if (!vm) return -1;
+    }
+    randomx_calculate_hash(vm, input, len, out32);
+    return 0;
+}
+
 // inline asm helpers
 static inline uint64_t bswap64_asm(uint64_t x)
 {
@@ -466,8 +579,14 @@ static ssize_t io_read(conn_ctx_t *ctx, void *buf, size_t len) {
     }
 #ifdef HAVE_OPENSSL
     if (ctx->ssl) {
-        int r = SSL_read(ctx->ssl, buf, (int)len);
-        return r;
+        for(;;){
+            int r = SSL_read(ctx->ssl, buf, (int)len);
+            if (r > 0) return r;
+            int e = SSL_get_error(ctx->ssl, r);
+            if (e == SSL_ERROR_WANT_READ) { (void)wait_fd_ready(ctx->fd, 0, -1); continue; }
+            if (e == SSL_ERROR_WANT_WRITE){ (void)wait_fd_ready(ctx->fd, 1, -1); continue; }
+            return -1;
+        }
     }
 #endif
     return read(ctx->fd, buf, len);
@@ -479,8 +598,11 @@ static ssize_t io_write(conn_ctx_t *ctx, const void *buf, size_t len) {
         size_t off = 0;
         while (off < len) {
             int w = SSL_write(ctx->ssl, (const char*)buf + off, (int)(len - off));
-            if (w <= 0) return -1;
-            off += (size_t)w;
+            if (w > 0) { off += (size_t)w; continue; }
+            int e = SSL_get_error(ctx->ssl, w);
+            if (e == SSL_ERROR_WANT_READ) { (void)wait_fd_ready(ctx->fd, 0, -1); continue; }
+            if (e == SSL_ERROR_WANT_WRITE){ (void)wait_fd_ready(ctx->fd, 1, -1); continue; }
+            return -1;
         }
         return (ssize_t)len;
     }
@@ -493,10 +615,11 @@ static int send_frame_locked(conn_ctx_t *ctx, uint8_t opcode, const void* payloa
     unsigned char hdr[8];
     for (int i=7;i>=0;--i){ hdr[i]=total & 0xFF; total >>=8; }
     pthread_mutex_lock(&ctx->wlock);
-    if (io_write(ctx, hdr, 8) != 8){ pthread_mutex_unlock(&ctx->wlock); return -1; }
-    if (io_write(ctx, &opcode, 1) != 1){ pthread_mutex_unlock(&ctx->wlock); return -1; }
-    if (len>0) if (io_write(ctx, payload, (size_t)len) != (ssize_t)len){ pthread_mutex_unlock(&ctx->wlock); return -1; }
+    if (io_write(ctx, hdr, 8) != 8){ pthread_mutex_unlock(&ctx->wlock); __sync_add_and_fetch(&g_ctr_errors, 1); return -1; }
+    if (io_write(ctx, &opcode, 1) != 1){ pthread_mutex_unlock(&ctx->wlock); __sync_add_and_fetch(&g_ctr_errors, 1); return -1; }
+    if (len>0) if (io_write(ctx, payload, (size_t)len) != (ssize_t)len){ pthread_mutex_unlock(&ctx->wlock); __sync_add_and_fetch(&g_ctr_errors, 1); return -1; }
     pthread_mutex_unlock(&ctx->wlock);
+    __sync_add_and_fetch(&g_ctr_frames_out, 1);
     return 0;
 }
 
@@ -514,6 +637,13 @@ static void* worker_thread(void* arg) {
         job_t* j = dequeue_job();
         if (!j) continue;
         uint64_t processed = 0;
+        // Extended mode local buffer
+        unsigned char *buf = NULL;
+        if (j->blob_len > 0) {
+            buf = (unsigned char*)malloc(j->blob_len);
+            if (!buf) { j->canceled = 1; }
+            else memcpy(buf, j->blob, j->blob_len);
+        }
         for (uint64_t i=0;i<j->nonce_count && !j->canceled;i++) {
             uint64_t nonce = j->nonce_start + i;
             unsigned char hash[32];
@@ -521,7 +651,18 @@ static void* worker_thread(void* arg) {
 #ifdef HAVE_RANDOMX
             if (j->flags & 0x01) {
                 ensure_rx_seed(j->rx_seed);
-                got = hash_randomx(j->header, sizeof(j->header), nonce, hash);
+                if (j->blob_len > 0 && buf) {
+                    // write nonce into blob (little-endian)
+                    if (j->nonce_size == 8) {
+                        uint64_t nle = nonce; memcpy(buf + j->nonce_off, &nle, 8);
+                    } else {
+                        uint32_t n32 = (uint32_t)nonce; memcpy(buf + j->nonce_off, &n32, 4);
+                    }
+                    // hash full blob
+                    got = hash_randomx_data(buf, j->blob_len, hash);
+                } else {
+                    got = hash_randomx(j->header, sizeof(j->header), nonce, hash);
+                }
             }
 #endif
             if (got != 0) {
@@ -531,7 +672,12 @@ static void* worker_thread(void* arg) {
             int ok = 0;
 #ifdef HAVE_RANDOMX
             if (j->flags & 0x01) {
-                ok = hash_meets_target(hash, j->target);
+                if (j->target64) {
+                    uint64_t value = 0; memcpy(&value, hash + 24, 8);
+                    ok = (value < j->target64);
+                } else {
+                    ok = hash_meets_target(hash, j->target);
+                }
             } else
 #endif
             {
@@ -545,7 +691,9 @@ static void* worker_thread(void* arg) {
                 uint64_t nbe = htobe64(nonce);
                 memcpy(payload+8, &nbe, 8);
                 memcpy(payload+16, hash, 32);
-                send_frame_locked(ctx, OPC_RESULT, payload, sizeof(payload));
+                if (0 == send_frame_locked(ctx, OPC_RESULT, payload, sizeof(payload))) {
+                    __sync_add_and_fetch(&g_ctr_results, 1);
+                }
             }
             processed++;
             // optional: throttle yield to allow cancel handling
@@ -561,8 +709,12 @@ static void* worker_thread(void* arg) {
         memcpy(donep, &jid, 8);
         uint64_t pbe = htobe64(processed);
         memcpy(donep+8, &pbe, 8);
-        send_frame_locked(ctx, OPC_DONE, donep, sizeof(donep));
+        if (0 == send_frame_locked(ctx, OPC_DONE, donep, sizeof(donep))) {
+            __sync_add_and_fetch(&g_ctr_done, 1);
+        }
         jobs_remove(j->job_id);
+        if (buf) free(buf);
+        if (j->blob) free(j->blob);
         free(j);
     }
     return NULL;
@@ -592,9 +744,15 @@ static void handle_connection(int cfd) {
     #ifdef HAVE_OPENSSL
     if (g_tls_enabled && g_ssl_ctx) {
         ctx->ssl = SSL_new(g_ssl_ctx);
-        if (!ctx->ssl) goto conn_close;
+        if (!ctx->ssl) { __sync_add_and_fetch(&g_ctr_tls_errors, 1); log_emit(LOG_ERROR, "SSL_new failed"); goto conn_close; }
         SSL_set_fd(ctx->ssl, cfd);
-        if (SSL_accept(ctx->ssl) <= 0) { SSL_free(ctx->ssl); ctx->ssl=NULL; goto conn_close; }
+        if (ssl_accept_with_timeout(ctx->ssl, cfd, 5000) != 0) {
+            __sync_add_and_fetch(&g_ctr_tls_errors, 1);
+            log_emit(LOG_ERROR, "TLS accept timeout/failure");
+            SSL_free(ctx->ssl); ctx->ssl=NULL; goto conn_close;
+        }
+        __sync_add_and_fetch(&g_ctr_tls_accepts, 1);
+        log_emit(LOG_INFO, "TLS accepted");
     }
     #endif
 
@@ -603,12 +761,12 @@ static void handle_connection(int cfd) {
     if (g_require_handshake) {
         uint8_t op=0; unsigned char *pl=NULL; uint64_t plen=0;
         if (recv_frame_simple(ctx, &op, &pl, &plen, 5000) != 0 || op != OPC_CLIENT_HELLO) {
-            send_error(ctx, 0x0002 /*auth_required*/, "handshake required");
+            send_error(ctx, 0x0002 /*auth_required*/, "handshake required"); __sync_add_and_fetch(&g_ctr_errors, 1);
             handshake_ok = 0;
         } else {
             // CLIENT_HELLO payload: ver(be16) | caps(be32) | tlen(be16) | token[...]
             if (plen < 2+4+2) {
-                send_error(ctx, 0x0004 /*malformed*/, "bad hello");
+                send_error(ctx, 0x0004 /*malformed*/, "bad hello"); __sync_add_and_fetch(&g_ctr_errors, 1);
                 handshake_ok = 0;
             } else {
                 const unsigned char *pp = pl;
@@ -618,10 +776,10 @@ static void handle_connection(int cfd) {
                 const char *tok = (const char*)pp; size_t toklen = (size_t)tlen;
                 if (2+4+2+toklen > plen) toklen = 0; // tolerate unknown tail
                 if (ver < 1) {
-                    send_error(ctx, 0x0001 /*version_unsupported*/, "version");
+                    send_error(ctx, 0x0001 /*version_unsupported*/, "version"); __sync_add_and_fetch(&g_ctr_errors, 1);
                     handshake_ok = 0;
                 } else if (!token_allowed(tok, toklen)) {
-                    send_error(ctx, 0x0003 /*unauthorized*/, "token");
+                    send_error(ctx, 0x0003 /*unauthorized*/, "token"); __sync_add_and_fetch(&g_ctr_errors, 1);
                     handshake_ok = 0;
                 } else {
                     // SERVER_HELLO: ver(be16) | caps(be32) | auth_required(u8)
@@ -634,7 +792,7 @@ static void handle_connection(int cfd) {
                     uint8_t auth_req = (g_auth_token && *g_auth_token) ? 1 : 0;
                     unsigned char sh[2+4+1];
                     memcpy(sh, &vbe, 2); memcpy(sh+2, &scbe, 4); sh[6]=auth_req;
-                    send_frame_locked(ctx, OPC_SERVER_HELLO, sh, sizeof(sh));
+                    if (0 == send_frame_locked(ctx, OPC_SERVER_HELLO, sh, sizeof(sh))) __sync_add_and_fetch(&g_ctr_server_hello, 1);
                 }
             }
         }
@@ -652,6 +810,7 @@ static void handle_connection(int cfd) {
             uint8_t op=0; unsigned char *pl=NULL; uint64_t plen=0;
             if (recv_frame_simple(ctx, &op, &pl, &plen, 500) == 0) {
                 if (op == OPC_CLIENT_HELLO) {
+                __sync_add_and_fetch(&g_ctr_hellos, 1);
                     const unsigned char *pp = pl;
                     if (plen >= 2+4+2) {
                         uint16_t ver; memcpy(&ver, pp, 2); pp+=2; ver = be16toh(ver);
@@ -669,9 +828,9 @@ static void handle_connection(int cfd) {
                             uint8_t auth_req = (g_auth_token && *g_auth_token) ? 1 : 0;
                             unsigned char sh[2+4+1];
                             memcpy(sh, &vbe, 2); memcpy(sh+2, &scbe, 4); sh[6]=auth_req;
-                            send_frame_locked(ctx, OPC_SERVER_HELLO, sh, sizeof(sh));
+                            if (0 == send_frame_locked(ctx, OPC_SERVER_HELLO, sh, sizeof(sh))) __sync_add_and_fetch(&g_ctr_server_hello, 1);
                         } else if (!token_allowed(tok, toklen)) {
-                            send_error(ctx, 0x0003, "token");
+                            send_error(ctx, 0x0003, "token"); __sync_add_and_fetch(&g_ctr_errors, 1);
                             if (pl) free(pl);
                             goto conn_close;
                         }
@@ -714,6 +873,7 @@ static void handle_connection(int cfd) {
         unsigned char hdr8[8];
         ssize_t r = io_read(ctx, hdr8, 8);
         if (r <= 0) break;
+        __sync_add_and_fetch(&g_ctr_frames_in, 1);
         uint64_t len_be = 0;
         memcpy(&len_be, hdr8, 8);
         uint64_t len = be64toh(len_be);
@@ -738,38 +898,77 @@ static void handle_connection(int cfd) {
             //  a) 80+32+8+4 = 124 bytes (no job_id, no flags)
             //  b) 80+32+8+4+8 = 132 bytes (with job_id)
             //  c) 80+32+8+4+8+1 = 133 bytes (with job_id + flags)
-            if (payload_len < (80+32+8+4)) { free(p); continue; }
             job_t* j = calloc(1, sizeof(job_t));
+            if (!j) { free(p); continue; }
             uint8_t *pp = p;
-            memcpy(j->header, pp, 80); pp += 80;
-            memcpy(j->target, pp, 32); pp += 32;
-            uint64_t ns; memcpy(&ns, pp, 8); pp += 8; j->nonce_start = be64toh(ns);
-            uint32_t nc; memcpy(&nc, pp, 4); pp += 4; j->nonce_count = be32toh(nc);
-            if (g_max_batch > 0 && j->nonce_count > g_max_batch) j->nonce_count = g_max_batch;
-            j->flags = 0;
-            j->canceled = 0;
-            if (payload_len >= (80+32+8+4+8)) {
-                uint64_t jid; memcpy(&jid, pp, 8); pp += 8; j->job_id = be64toh(jid);
-            } else {
-                j->job_id = (uint64_t)time(NULL) ^ (uint64_t)rand();
-            }
-            if ((size_t)(pp - p) < payload_len) {
-                // optional flags
-                j->flags = *pp; pp += 1;
-            }
-#ifdef HAVE_RANDOMX
-            if (j->flags & 0x01) {
-                if ((size_t)(pp - p) + 32 + 4 <= payload_len) {
-                    memcpy(j->rx_seed, pp, 32); pp += 32;
-                    uint32_t bhe; memcpy(&bhe, pp, 4); pp += 4; j->rx_height = be32toh(bhe);
-                } else {
-                    // missing RandomX params -> disable
-                    j->flags &= ~0x01;
+            // Extended format check: magic 'X''J'
+            if (payload_len >= 2 && pp[0] == 'X' && pp[1] == 'J') {
+                pp += 2;
+                if ((size_t)(pp - p) >= payload_len) { free(j); free(p); continue; }
+                uint8_t ver = *pp++; (void)ver;
+                uint64_t jid; if ((size_t)(pp - p) + 8 > payload_len) { free(j); free(p); continue; }
+                memcpy(&jid, pp, 8); pp += 8; j->job_id = be64toh(jid);
+                if ((size_t)(pp - p) + 1 > payload_len) { free(j); free(p); continue; }
+                j->flags = *pp++;
+                if ((size_t)(pp - p) + 1 + 4 + 4 > payload_len) { free(j); free(p); continue; }
+                j->nonce_size = *pp++;
+                uint32_t offbe; memcpy(&offbe, pp, 4); pp += 4; j->nonce_off = be32toh(offbe);
+                uint32_t blbe; memcpy(&blbe, pp, 4); pp += 4; j->blob_len = be32toh(blbe);
+                if ((size_t)(pp - p) + j->blob_len + 8 + 4 + 32 > payload_len) { free(j); free(p); continue; }
+                if (j->blob_len > 0) { j->blob = (unsigned char*)malloc(j->blob_len); if (!j->blob) { free(j); free(p); continue; } memcpy(j->blob, pp, j->blob_len); }
+                pp += j->blob_len;
+                uint64_t ns; memcpy(&ns, pp, 8); pp += 8; j->nonce_start = be64toh(ns);
+                uint32_t nc; memcpy(&nc, pp, 4); pp += 4; j->nonce_count = be32toh(nc);
+                if (g_max_batch > 0 && j->nonce_count > g_max_batch) j->nonce_count = g_max_batch;
+                memcpy(j->target, pp, 32); pp += 32;
+                // Optional target64 (be64) if present
+                if ((size_t)(pp - p) + 8 <= payload_len) {
+                    uint64_t t64; memcpy(&t64, pp, 8); pp += 8; j->target64 = be64toh(t64);
                 }
-            }
+#ifdef HAVE_RANDOMX
+                if (j->flags & 0x01) {
+                    if ((size_t)(pp - p) + 32 + 4 <= payload_len) {
+                        memcpy(j->rx_seed, pp, 32); pp += 32;
+                        uint32_t bhe; memcpy(&bhe, pp, 4); pp += 4; j->rx_height = be32toh(bhe);
+                    } else {
+                        j->flags &= ~0x01;
+                    }
+                }
 #endif
+            } else {
+                // Legacy format
+                if (payload_len < (80+32+8+4)) { free(j); free(p); continue; }
+                memcpy(j->header, pp, 80); pp += 80;
+                memcpy(j->target, pp, 32); pp += 32;
+                uint64_t ns; memcpy(&ns, pp, 8); pp += 8; j->nonce_start = be64toh(ns);
+                uint32_t nc; memcpy(&nc, pp, 4); pp += 4; j->nonce_count = be32toh(nc);
+                if (g_max_batch > 0 && j->nonce_count > g_max_batch) j->nonce_count = g_max_batch;
+                j->flags = 0;
+                j->canceled = 0;
+                if (payload_len >= (80+32+8+4+8)) {
+                    uint64_t jid2; memcpy(&jid2, pp, 8); pp += 8; j->job_id = be64toh(jid2);
+                } else {
+                    j->job_id = (uint64_t)time(NULL) ^ (uint64_t)rand();
+                }
+                if ((size_t)(pp - p) < payload_len) {
+                    // optional flags
+                    j->flags = *pp; pp += 1;
+                }
+#ifdef HAVE_RANDOMX
+                if (j->flags & 0x01) {
+                    if ((size_t)(pp - p) + 32 + 4 <= payload_len) {
+                        memcpy(j->rx_seed, pp, 32); pp += 32;
+                        uint32_t bhe; memcpy(&bhe, pp, 4); pp += 4; j->rx_height = be32toh(bhe);
+                    } else {
+                        // missing RandomX params -> disable
+                        j->flags &= ~0x01;
+                    }
+                }
+#endif
+            }
             jobs_add(j->job_id, j);
-            if (enqueue_job(j) != 0) { jobs_remove(j->job_id); free(j); }
+            if (enqueue_job(j) != 0) { jobs_remove(j->job_id); if (j->blob) free(j->blob); free(j); __sync_add_and_fetch(&g_ctr_jobs_drop, 1); }
+            else { __sync_add_and_fetch(&g_ctr_jobs_enq, 1); }
         } else if (opcode == OPC_JOB_ABORT) {
             if (payload_len >= 8){
                 uint64_t jid; memcpy(&jid, p, 8); uint64_t job_id = be64toh(jid);
@@ -778,6 +977,7 @@ static void handle_connection(int cfd) {
             }
         } else if (opcode == OPC_PING) {
             send_frame_locked(ctx, OPC_PONG, NULL, 0);
+            __sync_add_and_fetch(&g_ctr_pings, 1);
         } else if (opcode == OPC_META_REQ) {
             // re-send META_RESP
             send_frame_locked(ctx, OPC_META_RESP, meta, (uint64_t)meta_len);
@@ -844,6 +1044,8 @@ int main(int argc, char **argv) {
         if (strcmp(argv[i], "-p") == 0 && i+1 < argc){ port = atoi(argv[++i]); }
         else if (strcmp(argv[i], "-T") == 0 && i+1 < argc){ g_auth_token = argv[++i]; }
         else if (strcmp(argv[i], "--require-handshake") == 0){ g_require_handshake = 1; }
+        else if (strcmp(argv[i], "--log-level") == 0 && i+1 < argc){ const char *lv = argv[++i]; g_log_level = (!strcmp(lv,"debug")?LOG_DEBUG:!strcmp(lv,"info")?LOG_INFO:LOG_ERROR); }
+        else if (strcmp(argv[i], "--stats-interval") == 0 && i+1 < argc){ g_stats_interval_sec = atoi(argv[++i]); }
         else if (strcmp(argv[i], "--max-workers") == 0 && i+1 < argc){ g_max_workers = atoi(argv[++i]); }
         else if (strcmp(argv[i], "--max-batch") == 0 && i+1 < argc){ g_max_batch = (uint32_t)strtoul(argv[++i], NULL, 10); }
         else if (strcmp(argv[i], "--throttle-temp") == 0 && i+1 < argc){ g_throttle_temp_c = atoi(argv[++i]); }
@@ -888,8 +1090,9 @@ int main(int argc, char **argv) {
         fprintf(stderr, "sandbox init failed\n");
         return 1;
     }
-    // Launch throttle monitor
+    // Launch throttle monitor + stats thread
     pthread_t tm; pthread_create(&tm, NULL, throttle_monitor_thread, NULL); pthread_detach(tm);
+    pthread_t st; pthread_create(&st, NULL, stats_thread, NULL); pthread_detach(st);
 
     // Reap children to avoid zombies
     signal(SIGCHLD, SIG_IGN);

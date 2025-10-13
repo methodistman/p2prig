@@ -17,6 +17,13 @@
 #include <cstdlib>
 #include <string>
 #include <vector>
+#include <thread>
+#include <atomic>
+#include <mutex>
+#include <fcntl.h>
+
+#include "base/net/stratum/Job.h"
+#include "net/JobResults.h"
 
 namespace xmrig {
 
@@ -36,6 +43,15 @@ public:
     int port = 0;
     std::string token;
     bool handshakeDone = false;
+    // Mining state
+    std::thread rxThread;
+    std::atomic<bool> stopRx{false};
+    std::mutex sendMtx;
+    Job jobCopy;
+    std::atomic<uint64_t> nextJobId{1};
+    uint64_t jobId = 0;
+    uint64_t nonceNext = 0;
+    uint32_t batchSize = 1u<<20; // default 1M
 };
 
 RemoteBackend::RemoteBackend(Controller *controller) : d_ptr(new RemoteBackendPrivate(controller)) {}
@@ -80,7 +96,52 @@ void RemoteBackend::printHashrate(bool) {}
 
 void RemoteBackend::printHealth() {}
 
-void RemoteBackend::setJob(const Job &) {}
+void RemoteBackend::setJob(const Job &job) {
+    auto d = d_ptr;
+    if (!d->handshakeDone || d->sock < 0) return;
+    d->jobCopy = job;
+    d->nonceNext = 0;
+    // Abort previous job on device
+    if (d->jobId != 0) {
+        uint8_t abortp[8]; uint64_t x = d->jobId; for (int i=7;i>=0;--i){ abortp[i]=static_cast<uint8_t>(x&0xFF); x>>=8; }
+        std::lock_guard<std::mutex> lk(d->sendMtx);
+        send_frame(d->sock, 0x11 /*JOB_ABORT*/, abortp, 8);
+    }
+    d->jobId = d->nextJobId.fetch_add(1);
+
+    // Build and send initial JOB_SUBMIT (extended XJ)
+    const bool rx = (job.algorithm().family() == Algorithm::RANDOM_X);
+    const uint8_t *blob = job.blob(); size_t blen = job.size();
+    const uint32_t off = static_cast<uint32_t>(job.nonceOffset());
+    const uint8_t nsize = static_cast<uint8_t>(job.nonceSize());
+    std::vector<uint8_t> pl; pl.reserve(2+1+8+1+4+4 + blen + 8 + 4 + 32 + 8 + (rx?32+4:0));
+    pl.push_back('X'); pl.push_back('J');
+    pl.push_back(1);
+    uint64_t jidbe = d->jobId; uint8_t tmp8[8]; for (int i=7;i>=0;--i){ tmp8[i]=static_cast<uint8_t>(jidbe & 0xFF); jidbe >>=8; }
+    pl.insert(pl.end(), tmp8, tmp8+8);
+    pl.push_back(rx ? 0x01 : 0x00);
+    pl.push_back(nsize);
+    uint32_t offbe = htonl(off); pl.insert(pl.end(), (uint8_t*)&offbe, (uint8_t*)&offbe+4);
+    uint32_t blbe = htonl(static_cast<uint32_t>(blen)); pl.insert(pl.end(), (uint8_t*)&blbe, (uint8_t*)&blbe+4);
+    pl.insert(pl.end(), blob, blob + blen);
+    // nonce_start
+    uint64_t ns = d->nonceNext; uint8_t ns8[8]; for (int i=7;i>=0;--i){ ns8[i]=static_cast<uint8_t>(ns&0xFF); ns>>=8; }
+    pl.insert(pl.end(), ns8, ns8+8);
+    uint32_t ncbe = htonl(d->batchSize); pl.insert(pl.end(), (uint8_t*)&ncbe, (uint8_t*)&ncbe+4);
+    // target32 (unused if target64 provided)
+    pl.insert(pl.end(), 32, 0);
+    // target64
+    uint64_t t64 = job.target(); uint8_t t8[8]; for (int i=7;i>=0;--i){ t8[i]=static_cast<uint8_t>(t64&0xFF); t64>>=8; }
+    pl.insert(pl.end(), t8, t8+8);
+    if (rx) {
+        const auto &seed = job.seed(); pl.insert(pl.end(), seed.data(), seed.data()+32);
+        uint32_t hbe = htonl(static_cast<uint32_t>(job.height())); pl.insert(pl.end(), (uint8_t*)&hbe, (uint8_t*)&hbe+4);
+    }
+    {
+        std::lock_guard<std::mutex> lk(d->sendMtx);
+        send_frame(d->sock, 0x10 /*JOB_SUBMIT*/, pl.data(), pl.size());
+    }
+}
 
 void RemoteBackend::start(IWorker *, bool) {
     auto d = d_ptr;
@@ -170,10 +231,94 @@ void RemoteBackend::start(IWorker *, bool) {
     d->handshakeDone = true;
     d->profileName = String("remote");
     LOG_INFO("%s remote connected to %s:%d (caps=0x%08x)", Tags::backend(), d->host.c_str(), d->port, scaps);
+
+    // Optional: read META_RESP if present (non-blocking quick peek)
+    ::fcntl(d->sock, F_SETFL, O_NONBLOCK);
+    uint8_t pop; std::vector<uint8_t> ppl;
+    if (recv_frame(d->sock, pop, ppl)) {
+        // ignore content or parse JSON for max_batch
+    }
+    ::fcntl(d->sock, F_SETFL, 0);
+
+    // batch size from env
+    if (const char *bs = ::getenv("P2PRIG_BATCH")) {
+        uint32_t v = static_cast<uint32_t>(::strtoul(bs, nullptr, 10));
+        if (v > 0) d->batchSize = v;
+    }
+
+    // Start reader thread
+    d->stopRx = false;
+    d->rxThread = std::thread([d]() {
+        for (;;) {
+            if (d->stopRx) break;
+            uint8_t op; std::vector<uint8_t> pay;
+            if (!recv_frame(d->sock, op, pay)) break;
+            if (op == 0x12 /*RESULT*/) {
+                if (pay.size() >= 8+8+32) {
+                    uint64_t jid = 0; for (int i=0;i<8;i++) jid = (jid<<8) | pay[i];
+                    uint64_t nbe = 0; for (int i=0;i<8;i++) nbe = (nbe<<8) | pay[8+i];
+                    uint32_t nonce = static_cast<uint32_t>(nbe);
+                    if (jid == d->jobId) {
+                        JobResults::submit(d->jobCopy, nonce, pay.data()+16);
+                    }
+                }
+            } else if (op == 0x13 /*DONE*/) {
+                if (pay.size() >= 8+8) {
+                    uint64_t jid = 0; for (int i=0;i<8;i++) jid = (jid<<8) | pay[i];
+                    uint64_t processed = 0; for (int i=0;i<8;i++) processed = (processed<<8) | pay[8+i];
+                    (void)processed;
+                    if (jid == d->jobId) {
+                        // Submit next batch automatically
+                        // Reuse current job and increment nonceNext
+                        // Build and send XJ frame
+                        const Job &job = d->jobCopy;
+                        const bool rx = (job.algorithm().family() == Algorithm::RANDOM_X);
+                        const uint8_t *blob = job.blob(); size_t blen = job.size();
+                        const uint32_t off = static_cast<uint32_t>(job.nonceOffset());
+                        const uint8_t nsize = static_cast<uint8_t>(job.nonceSize());
+                        std::vector<uint8_t> pl2; pl2.reserve(2+1+8+1+4+4 + blen + 8 + 4 + 32 + 8 + (rx?32+4:0));
+                        pl2.push_back('X'); pl2.push_back('J');
+                        pl2.push_back(1);
+                        uint64_t jidbe = d->jobId; uint8_t tmp8[8];
+                        for (int i=7;i>=0;--i){ tmp8[i]=static_cast<uint8_t>(jidbe & 0xFF); jidbe >>=8; }
+                        pl2.insert(pl2.end(), tmp8, tmp8+8);
+                        pl2.push_back(rx ? 0x01 : 0x00);
+                        pl2.push_back(nsize);
+                        uint32_t offbe = htonl(off); pl2.insert(pl2.end(), (uint8_t*)&offbe, (uint8_t*)&offbe+4);
+                        uint32_t blbe = htonl(static_cast<uint32_t>(blen)); pl2.insert(pl2.end(), (uint8_t*)&blbe, (uint8_t*)&blbe+4);
+                        pl2.insert(pl2.end(), blob, blob + blen);
+                        // nonce_start
+                        d->nonceNext += d->batchSize;
+                        uint64_t ns = d->nonceNext; uint8_t ns8[8]; for (int i=7;i>=0;--i){ ns8[i]=static_cast<uint8_t>(ns&0xFF); ns>>=8; }
+                        pl2.insert(pl2.end(), ns8, ns8+8);
+                        uint32_t ncbe = htonl(d->batchSize); pl2.insert(pl2.end(), (uint8_t*)&ncbe, (uint8_t*)&ncbe+4);
+                        // target32 (unused if target64 provided)
+                        pl2.insert(pl2.end(), 32, 0);
+                        // target64
+                        uint64_t t64 = job.target(); uint8_t t8[8]; for (int i=7;i>=0;--i){ t8[i]=static_cast<uint8_t>(t64&0xFF); t64>>=8; }
+                        pl2.insert(pl2.end(), t8, t8+8);
+                        if (rx) {
+                            const auto &seed = job.seed(); pl2.insert(pl2.end(), seed.data(), seed.data()+32);
+                            uint32_t hbe = htonl(static_cast<uint32_t>(job.height())); pl2.insert(pl2.end(), (uint8_t*)&hbe, (uint8_t*)&hbe+4);
+                        }
+                        std::lock_guard<std::mutex> lk(d->sendMtx);
+                        send_frame(d->sock, 0x10 /*JOB_SUBMIT*/, pl2.data(), pl2.size());
+                    }
+                }
+            } else if (op == 0x20 /*PING*/) {
+                std::lock_guard<std::mutex> lk(d->sendMtx);
+                send_frame(d->sock, 0x21 /*PONG*/, nullptr, 0);
+            } else {
+                // ignore other frames
+            }
+        }
+    });
 }
 
 void RemoteBackend::stop() {
     auto d = d_ptr;
+    d->stopRx = true;
+    if (d->rxThread.joinable()) d->rxThread.join();
     if (d->sock >= 0) { ::close(d->sock); d->sock = -1; }
     d->enabled = false;
     d->handshakeDone = false;
