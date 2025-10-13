@@ -23,6 +23,7 @@
 #include <pwd.h>
 #include <grp.h>
 #include <sys/prctl.h>
+#include <signal.h>
 #ifdef HAVE_RANDOMX
 #include <randomx.h>
 #endif
@@ -82,6 +83,19 @@ static const char *g_tls_cert = NULL;
 static const char *g_tls_key  = NULL;
 static const char *g_tls_ca   = NULL; // optional CA for client cert verify
 #endif
+
+// Connection context (used by IO and writers)
+typedef struct {
+    int fd;
+    pthread_mutex_t wlock;
+#ifdef HAVE_OPENSSL
+    SSL *ssl;
+#endif
+    // Prefetch buffer used to "unread" a frame (for optional handshake probe)
+    unsigned char *prefetch;
+    size_t prefetch_len;
+    size_t prefetch_off;
+} conn_ctx_t;
 
 // 32-bit byte swap with inline assembly where available
 static inline uint32_t bswap32_asm(uint32_t x)
@@ -257,7 +271,6 @@ static int jq_head=0, jq_tail=0;
 static pthread_mutex_t jq_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t jq_cond = PTHREAD_COND_INITIALIZER;
 
-// Connection context (used by IO and writers)
 /* conn_ctx_t typedef moved earlier */
 
 // RandomX globals and helpers at file scope (when enabled)
@@ -435,15 +448,22 @@ static job_t* dequeue_job() {
     return j;
 }
 
-typedef struct {
-    int fd;
-    pthread_mutex_t wlock;
-#ifdef HAVE_OPENSSL
-    SSL *ssl;
-#endif
-} conn_ctx_t;
+/* conn_ctx_t typedef defined earlier */
 
 static ssize_t io_read(conn_ctx_t *ctx, void *buf, size_t len) {
+    // Serve from prefetch buffer first, if any
+    if (ctx->prefetch && ctx->prefetch_off < ctx->prefetch_len) {
+        size_t rem = ctx->prefetch_len - ctx->prefetch_off;
+        size_t n = rem < len ? rem : len;
+        memcpy(buf, ctx->prefetch + ctx->prefetch_off, n);
+        ctx->prefetch_off += n;
+        if (ctx->prefetch_off == ctx->prefetch_len) {
+            free(ctx->prefetch);
+            ctx->prefetch = NULL;
+            ctx->prefetch_len = ctx->prefetch_off = 0;
+        }
+        return (ssize_t)n;
+    }
 #ifdef HAVE_OPENSSL
     if (ctx->ssl) {
         int r = SSL_read(ctx->ssl, buf, (int)len);
@@ -621,38 +641,58 @@ static void handle_connection(int cfd) {
         if (pl) free(pl);
         if (!handshake_ok) goto conn_close;
     } else {
-        // Optional handshake: try to read CLIENT_HELLO quickly, otherwise proceed
-        uint8_t op=0; unsigned char *pl=NULL; uint64_t plen=0;
-        if (recv_frame_simple(ctx, &op, &pl, &plen, 500) == 0) {
-            if (op == OPC_CLIENT_HELLO) {
-                const unsigned char *pp = pl;
-                if (plen >= 2+4+2) {
-                    uint16_t ver; memcpy(&ver, pp, 2); pp+=2; ver = be16toh(ver);
-                    uint32_t caps; memcpy(&caps, pp, 4); pp+=4; (void)caps;
-                    uint16_t tlen; memcpy(&tlen, pp, 2); pp+=2; tlen = be16toh(tlen);
-                    const char *tok = (const char*)pp; size_t toklen = (size_t)tlen;
-                    if (2+4+2+toklen > plen) toklen = 0;
-                    if (ver >= 1 && token_allowed(tok, toklen)) {
-                        uint16_t vbe = htobe16(1);
-                        uint32_t scaps = 0;
-                        #ifdef HAVE_RANDOMX
-                            scaps |= 0x1u;
-                        #endif
-                        uint32_t scbe = htobe32(scaps);
-                        uint8_t auth_req = (g_auth_token && *g_auth_token) ? 1 : 0;
-                        unsigned char sh[2+4+1];
-                        memcpy(sh, &vbe, 2); memcpy(sh+2, &scbe, 4); sh[6]=auth_req;
-                        send_frame_locked(ctx, OPC_SERVER_HELLO, sh, sizeof(sh));
-                    } else if (!token_allowed(tok, toklen)) {
-                        send_error(ctx, 0x0003, "token");
-                        if (pl) free(pl);
-                        goto conn_close;
+        // Optional handshake: avoid blocking indefinitely under TLS
+        #ifdef HAVE_OPENSSL
+        if (ctx->ssl) {
+            // Skip optional probe when TLS is active
+        } else
+        #endif
+        {
+            // Try to read a frame quickly; if it's not HELLO, buffer it for later processing
+            uint8_t op=0; unsigned char *pl=NULL; uint64_t plen=0;
+            if (recv_frame_simple(ctx, &op, &pl, &plen, 500) == 0) {
+                if (op == OPC_CLIENT_HELLO) {
+                    const unsigned char *pp = pl;
+                    if (plen >= 2+4+2) {
+                        uint16_t ver; memcpy(&ver, pp, 2); pp+=2; ver = be16toh(ver);
+                        uint32_t caps; memcpy(&caps, pp, 4); pp+=4; (void)caps;
+                        uint16_t tlen; memcpy(&tlen, pp, 2); pp+=2; tlen = be16toh(tlen);
+                        const char *tok = (const char*)pp; size_t toklen = (size_t)tlen;
+                        if (2+4+2+toklen > plen) toklen = 0;
+                        if (ver >= 1 && token_allowed(tok, toklen)) {
+                            uint16_t vbe = htobe16(1);
+                            uint32_t scaps = 0;
+                            #ifdef HAVE_RANDOMX
+                                scaps |= 0x1u;
+                            #endif
+                            uint32_t scbe = htobe32(scaps);
+                            uint8_t auth_req = (g_auth_token && *g_auth_token) ? 1 : 0;
+                            unsigned char sh[2+4+1];
+                            memcpy(sh, &vbe, 2); memcpy(sh+2, &scbe, 4); sh[6]=auth_req;
+                            send_frame_locked(ctx, OPC_SERVER_HELLO, sh, sizeof(sh));
+                        } else if (!token_allowed(tok, toklen)) {
+                            send_error(ctx, 0x0003, "token");
+                            if (pl) free(pl);
+                            goto conn_close;
+                        }
+                    }
+                } else {
+                    // Buffer the non-HELLO frame for the main loop to consume
+                    uint64_t total = plen + 1;
+                    size_t flen = 8 + 1 + (size_t)plen;
+                    unsigned char *fb = (unsigned char*)malloc(flen);
+                    if (fb) {
+                        uint64_t t = total;
+                        for (int i=7;i>=0;--i){ fb[i] = (unsigned char)(t & 0xFF); t >>= 8; }
+                        fb[8] = op;
+                        if (plen) memcpy(fb+9, pl, (size_t)plen);
+                        ctx->prefetch = fb;
+                        ctx->prefetch_len = flen;
+                        ctx->prefetch_off = 0;
                     }
                 }
-            } else {
-                // Not a handshake; push nothing back (frame lost). Proceed.
+                if (pl) free(pl);
             }
-            if (pl) free(pl);
         }
     }
 
@@ -677,6 +717,8 @@ static void handle_connection(int cfd) {
         uint64_t len_be = 0;
         memcpy(&len_be, hdr8, 8);
         uint64_t len = be64toh(len_be);
+        // Cap frame length to 1 MiB payload to avoid OOM
+        if (len == 0 || len > ((1ULL<<20) + 1)) { send_error(ctx, 0x0004, "frame too large"); break; }
         if (len == 0) break;
         unsigned char opcode;
         if (io_read(ctx, &opcode, 1) != 1) break;
@@ -702,7 +744,7 @@ static void handle_connection(int cfd) {
             memcpy(j->header, pp, 80); pp += 80;
             memcpy(j->target, pp, 32); pp += 32;
             uint64_t ns; memcpy(&ns, pp, 8); pp += 8; j->nonce_start = be64toh(ns);
-            uint32_t nc; memcpy(&nc, pp, 4); pp += 4; j->nonce_count = bswap32_asm(nc);
+            uint32_t nc; memcpy(&nc, pp, 4); pp += 4; j->nonce_count = be32toh(nc);
             if (g_max_batch > 0 && j->nonce_count > g_max_batch) j->nonce_count = g_max_batch;
             j->flags = 0;
             j->canceled = 0;
@@ -719,7 +761,7 @@ static void handle_connection(int cfd) {
             if (j->flags & 0x01) {
                 if ((size_t)(pp - p) + 32 + 4 <= payload_len) {
                     memcpy(j->rx_seed, pp, 32); pp += 32;
-                    uint32_t bhe; memcpy(&bhe, pp, 4); pp += 4; j->rx_height = bswap32_asm(bhe);
+                    uint32_t bhe; memcpy(&bhe, pp, 4); pp += 4; j->rx_height = be32toh(bhe);
                 } else {
                     // missing RandomX params -> disable
                     j->flags &= ~0x01;
@@ -748,6 +790,7 @@ conn_close:
     #endif
     close(cfd);
     pthread_mutex_destroy(&ctx->wlock);
+    if (ctx->prefetch) { free(ctx->prefetch); ctx->prefetch = NULL; }
     free(ctx);
 }
 
@@ -847,6 +890,9 @@ int main(int argc, char **argv) {
     }
     // Launch throttle monitor
     pthread_t tm; pthread_create(&tm, NULL, throttle_monitor_thread, NULL); pthread_detach(tm);
+
+    // Reap children to avoid zombies
+    signal(SIGCHLD, SIG_IGN);
 
     printf("device daemon listening on :%d (handshake:%s, token:%s, workers:%s, max_batch:%s"
     #ifdef HAVE_OPENSSL
