@@ -1,0 +1,196 @@
+/* XMRig Remote Backend (experimental) - Phase 1/2 handshake */
+#include "backend/remote/RemoteBackend.h"
+#include "backend/common/Hashrate.h"
+#include "backend/common/Tags.h"
+#include "base/io/log/Log.h"
+#include "core/Controller.h"
+#include "core/config/Config.h"
+#include "3rdparty/rapidjson/document.h"
+
+// POSIX networking (Linux only for now)
+#include <arpa/inet.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
+#include <cstring>
+#include <cstdlib>
+#include <string>
+#include <vector>
+
+namespace xmrig {
+
+static const String kType = "remote";
+
+class RemoteBackendPrivate {
+public:
+    explicit RemoteBackendPrivate(Controller *controller) : controller(controller) {}
+
+    Controller *controller;
+    std::shared_ptr<Hashrate> hashrate;
+    String profileName;
+    bool enabled = false;
+    // Phase 1/2: simple env-configured connection & handshake
+    int sock = -1;
+    std::string host;
+    int port = 0;
+    std::string token;
+    bool handshakeDone = false;
+};
+
+RemoteBackend::RemoteBackend(Controller *controller) : d_ptr(new RemoteBackendPrivate(controller)) {}
+RemoteBackend::~RemoteBackend() { delete d_ptr; }
+
+bool RemoteBackend::isEnabled() const { return d_ptr->enabled; }
+
+bool RemoteBackend::isEnabled(const Algorithm &) const { return d_ptr->enabled; }
+
+bool RemoteBackend::tick(uint64_t) { return true; }
+
+const Hashrate *RemoteBackend::hashrate() const { return d_ptr->hashrate.get(); }
+
+const String &RemoteBackend::profileName() const { return d_ptr->profileName; }
+
+const String &RemoteBackend::type() const { return kType; }
+
+static bool send_all(int fd, const void *buf, size_t len) {
+    const uint8_t *p = static_cast<const uint8_t*>(buf);
+    size_t off = 0;
+    while (off < len) {
+        ssize_t w = ::write(fd, p + off, len - off);
+        if (w < 0) return false;
+        off += static_cast<size_t>(w);
+    }
+    return true;
+}
+
+static bool send_frame(int fd, uint8_t opcode, const uint8_t *payload, uint64_t plen) {
+    uint64_t total = plen + 1;
+    uint8_t hdr[8];
+    for (int i = 7; i >= 0; --i) { hdr[i] = static_cast<uint8_t>(total & 0xFF); total >>= 8; }
+    if (!send_all(fd, hdr, 8)) return false;
+    if (!send_all(fd, &opcode, 1)) return false;
+    if (plen) return send_all(fd, payload, static_cast<size_t>(plen));
+    return true;
+}
+
+void RemoteBackend::prepare(const Job &) {}
+
+void RemoteBackend::printHashrate(bool) {}
+
+void RemoteBackend::printHealth() {}
+
+void RemoteBackend::setJob(const Job &) {}
+
+void RemoteBackend::start(IWorker *, bool) {
+    auto d = d_ptr;
+    if (d->handshakeDone) return;
+    // Env-only config for now
+    const char *h = ::getenv("P2PRIG_HOST");
+    const char *p = ::getenv("P2PRIG_PORT");
+    const char *t = ::getenv("P2PRIG_TOKEN");
+    if (!h || !p) {
+        // remote disabled if host/port not provided
+        return;
+    }
+    d->host = h;
+    d->port = std::atoi(p);
+    if (t) d->token = t;
+
+    // Resolve and connect
+    struct addrinfo hints{}; memset(&hints, 0, sizeof(hints));
+    hints.ai_socktype = SOCK_STREAM; hints.ai_family = AF_UNSPEC;
+    struct addrinfo *res = nullptr;
+    char portbuf[16]; std::snprintf(portbuf, sizeof(portbuf), "%d", d->port);
+    int rc = ::getaddrinfo(d->host.c_str(), portbuf, &hints, &res);
+    if (rc != 0) {
+        LOG_ERR("remote: resolve %s:%d failed: %s", d->host.c_str(), d->port, gai_strerror(rc));
+        return;
+    }
+    int fd = -1;
+    for (auto it = res; it; it = it->ai_next) {
+        fd = ::socket(it->ai_family, it->ai_socktype, it->ai_protocol);
+        if (fd < 0) continue;
+        if (::connect(fd, it->ai_addr, it->ai_addrlen) == 0) break;
+        ::close(fd); fd = -1;
+    }
+    ::freeaddrinfo(res);
+    if (fd < 0) {
+        LOG_ERR("remote: connect %s:%d failed", d->host.c_str(), d->port);
+        return;
+    }
+
+    // Build CLIENT_HELLO: ver(be16)=1 | caps(be32) | tlen(be16) | token
+    uint16_t ver = htons(1);
+    uint32_t caps = htonl(0x00000001u); // bit0: RANDOMX support expected from device
+    uint16_t tlen = htons(static_cast<uint16_t>(d->token.size()));
+    std::vector<uint8_t> hello; hello.reserve(2+4+2 + d->token.size());
+    hello.insert(hello.end(), reinterpret_cast<uint8_t*>(&ver), reinterpret_cast<uint8_t*>(&ver)+2);
+    hello.insert(hello.end(), reinterpret_cast<uint8_t*>(&caps), reinterpret_cast<uint8_t*>(&caps)+4);
+    hello.insert(hello.end(), reinterpret_cast<uint8_t*>(&tlen), reinterpret_cast<uint8_t*>(&tlen)+2);
+    if (!d->token.empty()) hello.insert(hello.end(), d->token.begin(), d->token.end());
+    if (!send_frame(fd, 0x30 /*CLIENT_HELLO*/, hello.data(), hello.size())) {
+        LOG_ERR("remote: send CLIENT_HELLO failed");
+        ::close(fd);
+        return;
+    }
+
+    // Read response header
+    uint8_t hdr[8]; ssize_t r = ::read(fd, hdr, 8);
+    if (r != 8) { ::close(fd); return; }
+    uint64_t len = 0; for (int i=0;i<8;i++){ len = (len<<8) | hdr[i]; }
+    uint8_t op = 0; if (::read(fd, &op, 1) != 1) { ::close(fd); return; }
+    std::vector<uint8_t> pl;
+    if (len > 1) {
+        pl.resize(static_cast<size_t>(len-1));
+        if (::read(fd, pl.data(), pl.size()) != static_cast<ssize_t>(pl.size())) { ::close(fd); return; }
+    }
+    if (op == 0x7F /*ERROR*/) {
+        if (pl.size() >= 4) {
+            uint16_t c = (pl[0]<<8) | pl[1]; uint16_t mlen = (pl[2]<<8) | pl[3];
+            std::string msg; if (pl.size() >= 4 + mlen) msg.assign(reinterpret_cast<char*>(pl.data()+4), reinterpret_cast<char*>(pl.data()+4)+mlen);
+            LOG_ERR("remote: handshake ERROR code=%u msg=%s", (unsigned)c, msg.c_str());
+        } else {
+            LOG_ERR("remote: handshake ERROR");
+        }
+        ::close(fd);
+        return;
+    }
+    if (op != 0x31 /*SERVER_HELLO*/ || pl.size() < 2+4+1) {
+        LOG_ERR("remote: invalid SERVER_HELLO");
+        ::close(fd);
+        return;
+    }
+    uint16_t sver = (pl[0]<<8) | pl[1]; (void)sver;
+    uint32_t scaps = (pl[2]<<24) | (pl[3]<<16) | (pl[4]<<8) | pl[5]; (void)scaps;
+    uint8_t auth_req = pl[6]; (void)auth_req;
+
+    d->sock = fd;
+    d->enabled = true;
+    d->handshakeDone = true;
+    d->profileName = String("remote");
+    LOG_INFO("%s remote connected to %s:%d (caps=0x%08x)", Tags::backend(), d->host.c_str(), d->port, scaps);
+}
+
+void RemoteBackend::stop() {
+    auto d = d_ptr;
+    if (d->sock >= 0) { ::close(d->sock); d->sock = -1; }
+    d->enabled = false;
+    d->handshakeDone = false;
+}
+
+#ifdef XMRIG_FEATURE_API
+rapidjson::Value RemoteBackend::toJSON(rapidjson::Document &doc) const {
+    using namespace rapidjson;
+    auto &allocator = doc.GetAllocator();
+    Value out(kObjectType);
+    out.AddMember("type", type().toJSON(), allocator);
+    out.AddMember("enabled", isEnabled(), allocator);
+    out.AddMember("profile", profileName().toJSON(), allocator);
+    return out;
+}
+
+void RemoteBackend::handleRequest(IApiRequest &) {}
+#endif
+
+} // namespace xmrig

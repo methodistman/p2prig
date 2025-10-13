@@ -9,7 +9,7 @@ cmake-build-*/
 
 # Compiled binaries
 **/device_daemon
-**/xmrig
+xmrig/build/xmrig
 
 # Debian packaging artifacts
 *.deb

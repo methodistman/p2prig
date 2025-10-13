@@ -1,0 +1,14 @@
+Source: xmrig-remote
+Section: utils
+Priority: optional
+Maintainer: Gregory <gregory@example.com>
+Build-Depends: debhelper-compat (= 13), cmake, pkg-config, libuv1-dev, libssl-dev
+Standards-Version: 4.6.2
+Rules-Requires-Root: no
+
+Package: xmrig-remote
+Architecture: amd64
+Depends: ${shlibs:Depends}, ${misc:Depends}
+Description: XMRig miner with experimental remote backend
+ XMRig CPU miner with an experimental remote device backend enabled.
+ Built without OpenCL/CUDA to minimize dependencies.

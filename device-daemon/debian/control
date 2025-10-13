@@ -1,0 +1,15 @@
+Source: device-daemon
+Section: utils
+Priority: optional
+Maintainer: Gregory <gregory@example.com>
+Build-Depends: debhelper-compat (= 13), librandomx-dev:arm64, crossbuild-essential-arm64 | gcc-aarch64-linux-gnu
+Standards-Version: 4.6.2
+Rules-Requires-Root: no
+
+Package: device-daemon
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}
+Description: Remote mining device daemon with RandomX support
+ A lightweight daemon that accepts hashing jobs over a small binary RPC,
+ executes them on the device, and reports results. Supports RandomX
+ hashing and a multithreaded worker pool.

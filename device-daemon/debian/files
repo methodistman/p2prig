@@ -1,0 +1,3 @@
+device-daemon-dbgsym_0.1.0_arm64.deb debug optional automatic=yes
+device-daemon_0.1.0_arm64.buildinfo utils optional
+device-daemon_0.1.0_arm64.deb utils optional

@@ -1,0 +1,12 @@
+Package: device-daemon
+Version: 0.1.0
+Architecture: arm64
+Maintainer: Gregory <gregory@example.com>
+Installed-Size: 75
+Depends: libc6 (>= 2.38), librandomx0 (>= 1.1.7)
+Section: utils
+Priority: optional
+Description: Remote mining device daemon with RandomX support
+ A lightweight daemon that accepts hashing jobs over a small binary RPC,
+ executes them on the device, and reports results. Supports RandomX
+ hashing and a multithreaded worker pool.

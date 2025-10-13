@@ -20,12 +20,7 @@ A monorepo for a peer-to-peer mining setup:
   ./xmrig/build/xmrig --stress --donate-level=0 --print-time=10
   ```
 
-- Cross-build ARM64 .deb for device-daemon:
-  ```bash
-  cd device-daemon
-  dpkg-buildpackage -us -uc -B -aarm64
-  ```
-  Artifacts appear in repo root (../device-daemon_*.deb).
+- Cross-build ARM64 .deb for device-daemon: GPLv3 (see ).
 
 - Run device-daemon on ARM64 target:
   ```bash
@@ -44,5 +39,5 @@ A monorepo for a peer-to-peer mining setup:
 ## Licensing
 
 - xmrig/ is GPLv3 (see `xmrig/LICENSE`).
-- device-daemon: pending license selection by repository owner. Until then, treat as "All rights reserved" for redistribution; intended to be compatible with GPLv3.
+- device-daemon: GPLv3 (see `device-daemon/LICENSE`).
 

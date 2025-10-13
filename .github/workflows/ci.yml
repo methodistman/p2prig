@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build-xmrig-amd64:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake pkg-config libuv1-dev libssl-dev
+      - name: Configure
+        run: cmake -S xmrig -B xmrig/build -DWITH_REMOTE=ON -DWITH_OPENCL=OFF -DWITH_CUDA=OFF -DWITH_HWLOC=OFF
+      - name: Build
+        run: cmake --build xmrig/build -j$(nproc)
+      - name: Upload xmrig artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: xmrig-linux-amd64
+          path: xmrig/build/xmrig
+
+  build-daemon-amd64:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential librandomx-dev
+      - name: Build device-daemon (native)
+        run: |
+          cd device-daemon
+          gcc -O2 -pthread -DHAVE_RANDOMX -o device_daemon device_daemon.c -lrandomx
+      - name: Upload daemon artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: device-daemon-linux-amd64
+          path: device-daemon/device_daemon

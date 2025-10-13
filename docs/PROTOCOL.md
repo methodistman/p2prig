@@ -1,3 +1,37 @@
+## Phase 1: Handshake and negotiation
+
+Handshake is performed once per TCP connection before any job frames when required by policy.
+
+- `CLIENT_HELLO` payload:
+  - `ver` (be16): protocol version requested (>=1)
+  - `caps` (be32): capability bitset requested by the client
+    - bit0 = RANDOMX supported by client/expectation
+  - `tlen` (be16): length of token (see Phase 2)
+  - `token[tlen]` (bytes): optional auth token
+
+- `SERVER_HELLO` payload:
+  - `ver` (be16): negotiated protocol version (1 for this phase)
+  - `caps` (be32): device capability bitset
+    - bit0 = RANDOMX supported by device
+  - `auth_required` (u8): whether this device requires authentication
+
+Clients should tolerate unknown tail fields (forward compatible). If handshake is not required, legacy flows MAY proceed directly to `META_RESP` and job frames.
+
+## Phase 1: ERROR frame
+
+`ERROR` payload:
+- `code` (be16): semantic error code
+- `msg_len` (be16): length of message
+- `msg[msg_len]` (bytes): UTF-8 error string (optional)
+
+Suggested codes:
+- `0x0001` version_unsupported
+- `0x0002` auth_required
+- `0x0003` unauthorized
+- `0x0004` malformed
+
+Devices should send `ERROR` and close on fatal negotiation failures. Unknown fields must be tolerated.
+
 # P2P Mining Protocol (Binary Frames)
 
 Length-prefixed binary framing over TCP/TLS. All multi-byte integers are big-endian unless stated otherwise.
@@ -15,6 +49,9 @@ Length-prefixed binary framing over TCP/TLS. All multi-byte integers are big-end
 - 0x13 `DONE`       (Device→Host)
 - 0x20 `PING`       (Either side)
 - 0x21 `PONG`       (Either side)
+ - 0x30 `CLIENT_HELLO` (Host→Device) [Phase 1]
+ - 0x31 `SERVER_HELLO` (Device→Host) [Phase 1]
+ - 0x7F `ERROR`        (Either side) [Phase 1]
 
 ## META_RESP
 

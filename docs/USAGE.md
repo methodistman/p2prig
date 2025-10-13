@@ -1,3 +1,15 @@
+### Connect to a remote device (Phase 1/2)
+
+Configure via environment variables (temporary interface for POC):
+
+```bash
+export P2PRIG_HOST=127.0.0.1
+export P2PRIG_PORT=9000
+export P2PRIG_TOKEN=secret-token   # optional if device doesn’t require token
+./xmrig/build/xmrig --stress --donate-level=0 --print-time=10
+```
+
+On successful handshake, XMRig logs a remote connection message and keeps the backend enabled.
 # Usage
 
 ## Device Daemon (ARM64)
@@ -12,7 +24,15 @@ sudo dpkg -i device-daemon_0.1.0_arm64.deb || sudo apt -f install
 ### Run
 
 ```bash
-device_daemon 9000  # default port 9000
+# Basic (no auth, legacy-compatible)
+device_daemon -p 9000
+
+# Require handshake + token auth (Phase 1/2)
+P2PRIG_TOKEN=secret-token device_daemon -p 9000 --require-handshake -T secret-token
+
+# Optional TLS (if built with HAVE_OPENSSL)
+device_daemon -p 9000 --tls-cert server.crt --tls-key server.key \
+  --tls-ca ca.crt --tls-require-client-cert --require-handshake -T secret-token
 ```
 
 - On start, the daemon listens on TCP `:9000` and sends a `META_RESP` JSON with `cpu_count` and `max_batch`.

@@ -1,0 +1,5 @@
+device-daemon (0.1.0) unstable; urgency=medium
+
+  * Initial release of device_daemon with RandomX support and RPC.
+
+ -- Gregory <gregory@example.com>  Mon, 13 Oct 2025 00:12:00 -0400

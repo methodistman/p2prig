@@ -1,0 +1,18 @@
+#!/usr/bin/make -f
+# Simple debhelper rules for device-daemon
+
+export DH_VERBOSE=1
+
+# Cross-compile: use host triplet CC if cross-building
+ifneq (,$(DEB_HOST_GNU_TYPE))
+export CC := $(DEB_HOST_GNU_TYPE)-gcc
+endif
+
+%:
+	dh $@
+
+override_dh_auto_build:
+	$(MAKE) device_daemon ENABLE_RANDOMX=1
+
+override_dh_auto_install:
+	install -D -m 0755 device_daemon debian/device-daemon/usr/bin/device_daemon

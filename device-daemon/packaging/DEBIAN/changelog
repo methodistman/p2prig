@@ -1,0 +1,51 @@
+p2p-miner (1.2.4) unstable; urgency=medium
+
+  * Wire: Peer list entries v1 with explicit byte order and lengths.
+  * Wire: UDP discovery beacons manualized with DISC + node_id + port + cp_q16.
+  * Interop: compute_power now Q16.16 (u32 be) on the wire; legacy fallback kept.
+  * Prep: entry fields include addr family/len (IPv6-ready) in peer list.
+
+ -- Your Name <you@example.com>  Thu, 09 Oct 2025 18:19:00 -0400
+
+p2p-miner (1.2.3) unstable; urgency=medium
+
+  * Network: add periodic MSG_HEARTBEAT broadcast (5s).
+  * Stability: prune stale peers with >30s inactivity.
+  * Minor: fix event loop frame handling and stats printing edge case.
+
+ -- Your Name <you@example.com>  Thu, 09 Oct 2025 18:10:00 -0400
+
+p2p-miner (1.2.2) unstable; urgency=medium
+
+  * Discovery: add discovered-peers table and gossip (MSG_PEER_LIST).
+  * Auto-connect: periodically connect to best discovered peer when isolated.
+  * Role: reconcile master/worker on HELLO by node_id ordering.
+  * Stability: continuous UDP beacons + peer list sharing for fast convergence.
+
+ -- Your Name <you@example.com>  Thu, 09 Oct 2025 16:59:00 -0400
+
+p2p-miner (1.2.1) unstable; urgency=medium
+
+  * Discovery: keep UDP socket open; periodic beacons; runtime peer connect.
+  * Stats: display Cluster Hashrate (local + recent peers) in periodic table.
+  * Minor: replace usleep with nanosleep; log tweaks.
+
+ -- Your Name <you@example.com>  Thu, 09 Oct 2025 16:38:00 -0400
+
+p2p-miner (1.2.0) unstable; urgency=medium
+
+  * MODE_AUTO: Add UDP broadcast auto-discovery (port 10000) and master election.
+  * Capability exchange and dataset-host selection heuristic (prefer highest RAM host).
+  * Implement dataset sharing via remote hashing (MSG_HASH_REQUEST/MSG_HASH_RESPONSE).
+  * Mining: full 256-bit target gating, OpenMP batch hashing, improved logging.
+  * Packaging: build and bundle librandomx.so into .debs (amd64, arm64); add ldconfig hooks; Depends: libgomp1.
+
+ -- Your Name <you@example.com>  Thu, 09 Oct 2025 15:10:00 -0400
+
+p2p-miner (1.1.0) unstable; urgency=medium
+
+  * Feature: Add Stratum protocol for pool connectivity.
+  * Feature: Add real RandomX library integration.
+  * Feature: Add modular algorithm support for RandomX and Ghostrider.
+
+ -- Your Name <you@example.com>  Tue, 08 Oct 2025 16:20:00 -0400

@@ -1,0 +1,3 @@
+xmrig-remote-dbgsym_6.21.0+remote1_amd64.deb debug optional automatic=yes
+xmrig-remote_6.21.0+remote1_amd64.buildinfo utils optional
+xmrig-remote_6.21.0+remote1_amd64.deb utils optional

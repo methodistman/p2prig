@@ -1,0 +1,10 @@
+Package: p2p-miner
+Version: ##VERSION##
+Architecture: ##ARCH##
+Maintainer: Your Name <you@example.com>
+Depends: libc6 (>= 2.34), libstdc++6, libgomp1
+Recommends: socat, ca-certificates
+Description: P2P Mining Cluster
+ A peer-to-peer distributed mining system for heterogeneous hardware.
+ This package contains the p2p-miner binary and a helper script
+ p2p-miner-unmineable-rx to connect to Unmineable over TLS using socat.

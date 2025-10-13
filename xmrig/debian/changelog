@@ -1,0 +1,6 @@
+xmrig-remote (6.21.0+remote1) unstable; urgency=medium
+
+  * Build XMRig with experimental remote backend (WITH_REMOTE=ON).
+    OpenCL/CUDA/HWLOC disabled to minimize dependencies.
+
+ -- Gregory <gregory@example.com>  Mon, 13 Oct 2025 00:13:00 -0400

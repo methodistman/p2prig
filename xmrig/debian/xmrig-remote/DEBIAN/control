@@ -1,0 +1,11 @@
+Package: xmrig-remote
+Version: 6.21.0+remote1
+Architecture: amd64
+Maintainer: Gregory <gregory@example.com>
+Installed-Size: 5477
+Depends: libc6 (>= 2.38), libssl3t64 (>= 3.0.0)
+Section: utils
+Priority: optional
+Description: XMRig miner with experimental remote backend
+ XMRig CPU miner with an experimental remote device backend enabled.
+ Built without OpenCL/CUDA to minimize dependencies.

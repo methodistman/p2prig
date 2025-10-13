@@ -1,0 +1,17 @@
+Checks: >
+  -*,
+  bugprone-*,
+  clang-analyzer-*,
+  cppcoreguidelines-avoid-goto,
+  cppcoreguidelines-avoid-magic-numbers,
+  cppcoreguidelines-init-variables,
+  cppcoreguidelines-narrowing-conversions,
+  misc-*,
+  modernize-*,
+  performance-*,
+  portability-*,
+  readability-*
+WarningsAsErrors: ''
+HeaderFilterRegex: '.*'
+AnalyzeTemporaryDtors: false
+FormatStyle: none
