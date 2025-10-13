@@ -16,6 +16,13 @@
 #include <endian.h>
 #include <unistd.h>
 #include <sys/time.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <dirent.h>
+#include <pwd.h>
+#include <grp.h>
+#include <sys/prctl.h>
 #ifdef HAVE_RANDOMX
 #include <randomx.h>
 #endif
@@ -54,6 +61,17 @@ typedef struct {
 // Phase 2: simple token-based auth (mTLS scaffolding behind HAVE_OPENSSL)
 static const char *g_auth_token = NULL;        // set via -T or env P2PRIG_TOKEN
 static int g_require_handshake = 0;            // set via --require-handshake
+// Phase 3: quotas and throttling
+static int g_max_workers = 0;                  // 0 = auto (online)
+static uint32_t g_max_batch = 0;               // 0 = unlimited
+static int g_throttle_temp_c = 80;             // temperature threshold
+static int g_throttle_batt_pct = 15;           // battery capacity threshold
+static int g_throttle_sleep_ms = 5;            // sleep per loop when throttled
+static volatile int g_throttle_on = 0;         // shared flag updated by monitor
+// Phase 4: sandboxing
+static char *g_run_as_user = NULL;             // user to drop privileges to
+static char *g_chroot_dir = NULL;              // optional chroot dir
+static int g_no_new_privs = 0;                 // prctl no_new_privs
 
 #ifdef HAVE_OPENSSL
 // TLS server globals (enabled when cert/key provided)
@@ -79,6 +97,90 @@ static inline uint32_t bswap32_asm(uint32_t x)
 #else
     return __builtin_bswap32(x);
 #endif
+}
+
+// ---- Phase 3: thermal & battery monitor ----
+static int read_int_file(const char *path, int *out)
+{
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return -1;
+    char buf[64]; int n = (int)read(fd, buf, sizeof(buf)-1);
+    close(fd);
+    if (n <= 0) return -1; buf[n] = '\0';
+    *out = atoi(buf);
+    return 0;
+}
+
+static int get_max_temp_c()
+{
+    int maxc = -1000;
+    DIR *d = opendir("/sys/class/thermal");
+    if (!d) return -1000;
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL) {
+        if (strncmp(de->d_name, "thermal_zone", 12) != 0) continue;
+        char path[256];
+        snprintf(path, sizeof(path), "/sys/class/thermal/%s/temp", de->d_name);
+        int millic=-1000; if (read_int_file(path, &millic) == 0) {
+            int c = millic / 1000;
+            if (c > maxc) maxc = c;
+        }
+    }
+    closedir(d);
+    return maxc;
+}
+
+static int get_battery_capacity()
+{
+    int cap = -1;
+    DIR *d = opendir("/sys/class/power_supply");
+    if (!d) return -1;
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL) {
+        if (strncmp(de->d_name, "BAT", 3) != 0) continue;
+        char path[256];
+        snprintf(path, sizeof(path), "/sys/class/power_supply/%s/capacity", de->d_name);
+        int v; if (read_int_file(path, &v) == 0) { cap = v; break; }
+    }
+    closedir(d);
+    return cap;
+}
+
+static int get_battery_charging()
+{
+    int charging = 0;
+    DIR *d = opendir("/sys/class/power_supply");
+    if (!d) return 0;
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL) {
+        if (strncmp(de->d_name, "BAT", 3) != 0) continue;
+        char path[256];
+        snprintf(path, sizeof(path), "/sys/class/power_supply/%s/status", de->d_name);
+        int fd = open(path, O_RDONLY);
+        if (fd >= 0) {
+            char buf[32]; int n = (int)read(fd, buf, sizeof(buf)-1); close(fd);
+            if (n > 0) { buf[n] = '\0'; if (strstr(buf, "Charging")) { charging = 1; break; } }
+        }
+    }
+    closedir(d);
+    return charging;
+}
+
+static void* throttle_monitor_thread(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        int tempc = get_max_temp_c();
+        int batt = get_battery_capacity();
+        int charging = get_battery_charging();
+        int on = 0;
+        if (tempc >= 0 && g_throttle_temp_c > 0 && tempc >= g_throttle_temp_c) on = 1;
+        if (!charging && batt >= 0 && g_throttle_batt_pct > 0 && batt <= g_throttle_batt_pct) on = 1;
+        g_throttle_on = on;
+        struct timespec ts = { .tv_sec = 2, .tv_nsec = 0 };
+        nanosleep(&ts, NULL);
+    }
+    return NULL;
 }
 
 // ---- Phase 1/2 helpers ----
@@ -428,6 +530,10 @@ static void* worker_thread(void* arg) {
             processed++;
             // optional: throttle yield to allow cancel handling
             if ((i & 0xFFF) == 0) sched_yield();
+            if (g_throttle_on && g_throttle_sleep_ms > 0) {
+                struct timespec ts = { .tv_sec = 0, .tv_nsec = (long)g_throttle_sleep_ms * 1000000L };
+                nanosleep(&ts, NULL);
+            }
         }
         // send DONE: job_id || processed_count
         unsigned char donep[8+8];
@@ -456,6 +562,7 @@ static void handle_connection(int cfd) {
     // simple fixed meta: cpu_count=online, max_batch=1<<20
     long online = sysconf(_SC_NPROCESSORS_ONLN);
     int workers = (online > 0 && online < 256) ? (int)online : 4;
+    if (g_max_workers > 0 && workers > g_max_workers) workers = g_max_workers;
 
     conn_ctx_t *ctx = (conn_ctx_t*)calloc(1, sizeof(conn_ctx_t));
     ctx->fd = cfd;
@@ -550,7 +657,8 @@ static void handle_connection(int cfd) {
     }
 
     char meta[128];
-    int meta_len = snprintf(meta, sizeof(meta), "{\"cpu_count\":%d,\"max_batch\":1048576}", workers);
+    uint32_t adv_max_batch = (g_max_batch > 0 ? g_max_batch : 1048576u);
+    int meta_len = snprintf(meta, sizeof(meta), "{\"cpu_count\":%d,\"max_batch\":%u}", workers, adv_max_batch);
     send_frame_locked(ctx, OPC_META_RESP, meta, (uint64_t)meta_len);
 
     // spawn worker threads (sharing same ctx for result writes)
@@ -595,6 +703,7 @@ static void handle_connection(int cfd) {
             memcpy(j->target, pp, 32); pp += 32;
             uint64_t ns; memcpy(&ns, pp, 8); pp += 8; j->nonce_start = be64toh(ns);
             uint32_t nc; memcpy(&nc, pp, 4); pp += 4; j->nonce_count = bswap32_asm(nc);
+            if (g_max_batch > 0 && j->nonce_count > g_max_batch) j->nonce_count = g_max_batch;
             j->flags = 0;
             j->canceled = 0;
             if (payload_len >= (80+32+8+4+8)) {
@@ -655,6 +764,33 @@ static int listen_socket(const char *addr, int port) {
     return s;
 }
 
+// ---- Phase 4: sandbox ----
+static int drop_privileges_and_sandbox()
+{
+    // no_new_privs
+    if (g_no_new_privs) {
+        if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0) {
+            perror("prctl no_new_privs");
+            return -1;
+        }
+    }
+    // chroot if requested
+    if (g_chroot_dir) {
+        if (chdir(g_chroot_dir) != 0) { perror("chdir chroot"); return -1; }
+        if (chroot(g_chroot_dir) != 0) { perror("chroot"); return -1; }
+        if (chdir("/") != 0) { perror("chdir /"); return -1; }
+    }
+    // drop to user
+    if (g_run_as_user) {
+        struct passwd *pw = getpwnam(g_run_as_user);
+        if (!pw) { fprintf(stderr, "unknown user: %s\n", g_run_as_user); return -1; }
+        if (setgid(pw->pw_gid) != 0) { perror("setgid"); return -1; }
+        if (setgroups(0, NULL) != 0) { perror("setgroups"); return -1; }
+        if (setuid(pw->pw_uid) != 0) { perror("setuid"); return -1; }
+    }
+    return 0;
+}
+
 int main(int argc, char **argv) {
     int port = 9000;
     const char *env_tok = getenv("P2PRIG_TOKEN");
@@ -665,6 +801,14 @@ int main(int argc, char **argv) {
         if (strcmp(argv[i], "-p") == 0 && i+1 < argc){ port = atoi(argv[++i]); }
         else if (strcmp(argv[i], "-T") == 0 && i+1 < argc){ g_auth_token = argv[++i]; }
         else if (strcmp(argv[i], "--require-handshake") == 0){ g_require_handshake = 1; }
+        else if (strcmp(argv[i], "--max-workers") == 0 && i+1 < argc){ g_max_workers = atoi(argv[++i]); }
+        else if (strcmp(argv[i], "--max-batch") == 0 && i+1 < argc){ g_max_batch = (uint32_t)strtoul(argv[++i], NULL, 10); }
+        else if (strcmp(argv[i], "--throttle-temp") == 0 && i+1 < argc){ g_throttle_temp_c = atoi(argv[++i]); }
+        else if (strcmp(argv[i], "--throttle-batt") == 0 && i+1 < argc){ g_throttle_batt_pct = atoi(argv[++i]); }
+        else if (strcmp(argv[i], "--throttle-sleep") == 0 && i+1 < argc){ g_throttle_sleep_ms = atoi(argv[++i]); }
+        else if (strcmp(argv[i], "--run-as") == 0 && i+1 < argc){ g_run_as_user = argv[++i]; }
+        else if (strcmp(argv[i], "--chroot") == 0 && i+1 < argc){ g_chroot_dir = argv[++i]; }
+        else if (strcmp(argv[i], "--no-new-privs") == 0){ g_no_new_privs = 1; }
         #ifdef HAVE_OPENSSL
         else if (strcmp(argv[i], "--tls-cert") == 0 && i+1 < argc){ g_tls_cert = argv[++i]; }
         else if (strcmp(argv[i], "--tls-key") == 0 && i+1 < argc){ g_tls_key = argv[++i]; }
@@ -696,12 +840,21 @@ int main(int argc, char **argv) {
     #endif
     int ls = listen_socket("0.0.0.0", port);
     if (ls<0){ perror("listen"); return 1; }
-    printf("device daemon listening on :%d (handshake:%s, token:%s"
+    // Apply sandbox after listening (to allow low ports) but before accept loop
+    if (drop_privileges_and_sandbox() != 0) {
+        fprintf(stderr, "sandbox init failed\n");
+        return 1;
+    }
+    // Launch throttle monitor
+    pthread_t tm; pthread_create(&tm, NULL, throttle_monitor_thread, NULL); pthread_detach(tm);
+
+    printf("device daemon listening on :%d (handshake:%s, token:%s, workers:%s, max_batch:%s"
     #ifdef HAVE_OPENSSL
            ", tls:%s"
     #endif
            ")\n",
-           port, g_require_handshake?"on":"off", (g_auth_token&&*g_auth_token)?"set":"none"
+           port, g_require_handshake?"on":"off", (g_auth_token&&*g_auth_token)?"set":"none",
+           (g_max_workers>0?"capped":"auto"), (g_max_batch>0?"capped":"unlimited")
     #ifdef HAVE_OPENSSL
            , g_tls_enabled?"on":"off"
     #endif
