@@ -26,12 +26,33 @@
 #include <signal.h>
 #include <poll.h>
 #include <stdarg.h>
-#ifdef HAVE_RANDOMX
-#include <randomx.h>
-#endif
 #ifdef HAVE_OPENSSL
 #include <openssl/ssl.h>
 #include <openssl/err.h>
+#endif
+#ifdef HAVE_RANDOMX
+#include <randomx.h>
+#endif
+
+// Android bionic compatibility for byte order helpers (Ubuntu glibc provides these via <endian.h>)
+#if defined(__ANDROID__)
+#ifndef htobe64
+# if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+#  define htobe64(x) __builtin_bswap64((uint64_t)(x))
+#  define be64toh(x) __builtin_bswap64((uint64_t)(x))
+#  define htobe32(x) __builtin_bswap32((uint32_t)(x))
+#  define be32toh(x) __builtin_bswap32((uint32_t)(x))
+#  define htobe16(x) __builtin_bswap16((uint16_t)(x))
+#  define be16toh(x) __builtin_bswap16((uint16_t)(x))
+# else
+#  define htobe64(x) (x)
+#  define be64toh(x) (x)
+#  define htobe32(x) (x)
+#  define be32toh(x) (x)
+#  define htobe16(x) (x)
+#  define be16toh(x) (x)
+# endif
+#endif
 #endif
 
 #define OPC_META_REQ 0x01
@@ -81,6 +102,8 @@ static volatile int g_throttle_on = 0;         // shared flag updated by monitor
 static char *g_run_as_user = NULL;             // user to drop privileges to
 static char *g_chroot_dir = NULL;              // optional chroot dir
 static int g_no_new_privs = 0;                 // prctl no_new_privs
+// Bind address (Android/Termux may require 127.0.0.1)
+static const char *g_bind_addr = "0.0.0.0";
 
 #ifdef HAVE_OPENSSL
 // TLS server globals (enabled when cert/key provided)
@@ -291,6 +314,9 @@ static void* throttle_monitor_thread(void *arg)
 }
 
 // ---- Phase 1/2 helpers ----
+// forward declarations for I/O helpers used below
+static ssize_t io_read(conn_ctx_t *ctx, void *buf, size_t len);
+static int send_frame_locked(conn_ctx_t *ctx, uint8_t opcode, const void* payload, uint64_t len);
 static int read_full_ctx(conn_ctx_t *ctx, void *buf, size_t len) {
     uint8_t *p = (uint8_t *)buf;
     size_t off = 0;
@@ -372,16 +398,22 @@ static pthread_mutex_t rx_lock = PTHREAD_MUTEX_INITIALIZER;
 static randomx_cache *g_rx_cache = NULL;
 static unsigned char g_rx_seed[32] = {0};
 static uint64_t g_rx_seed_ver = 0; // incremented on seed change
+static uint32_t g_rx_flags = (RANDOMX_FLAG_JIT | RANDOMX_FLAG_LARGE_PAGES | RANDOMX_FLAG_FULL_MEM);
 
 static void ensure_rx_seed(const unsigned char seed[32])
 {
     pthread_mutex_lock(&rx_lock);
     if (memcmp(g_rx_seed, seed, 32) != 0) {
         if (!g_rx_cache) {
-            g_rx_cache = randomx_alloc_cache(RANDOMX_FLAG_JIT | RANDOMX_FLAG_LARGE_PAGES | RANDOMX_FLAG_FULL_MEM);
-            if (!g_rx_cache) {
-                // fallback without large pages/full mem
-                g_rx_cache = randomx_alloc_cache(RANDOMX_FLAG_JIT);
+            // Try progressively less demanding flags for Android/Termux compatibility
+            const uint32_t tries[] = {
+                (RANDOMX_FLAG_JIT | RANDOMX_FLAG_LARGE_PAGES | RANDOMX_FLAG_FULL_MEM),
+                (RANDOMX_FLAG_JIT),
+                (0u)
+            };
+            for (size_t i = 0; i < sizeof(tries)/sizeof(tries[0]) && !g_rx_cache; ++i) {
+                randomx_cache *c = randomx_alloc_cache(tries[i]);
+                if (c) { g_rx_cache = c; g_rx_flags = tries[i]; }
             }
         }
         randomx_init_cache(g_rx_cache, seed, 32);
@@ -411,7 +443,8 @@ static int hash_randomx(const unsigned char *header, size_t header_len, uint64_t
         pthread_mutex_lock(&rx_lock);
         randomx_cache *cache = g_rx_cache;
         if (cache) {
-            vm = randomx_create_vm(RANDOMX_FLAG_JIT, cache, NULL);
+            uint32_t vm_flags = (g_rx_flags & RANDOMX_FLAG_JIT) ? RANDOMX_FLAG_JIT : 0u;
+            vm = randomx_create_vm(vm_flags, cache, NULL);
             tls_seed_ver = g_rx_seed_ver;
         }
         pthread_mutex_unlock(&rx_lock);
@@ -432,7 +465,8 @@ static int hash_randomx_data(const unsigned char *input, size_t len, unsigned ch
         pthread_mutex_lock(&rx_lock);
         randomx_cache *cache = g_rx_cache;
         if (cache) {
-            vm = randomx_create_vm(RANDOMX_FLAG_JIT, cache, NULL);
+            uint32_t vm_flags = (g_rx_flags & RANDOMX_FLAG_JIT) ? RANDOMX_FLAG_JIT : 0u;
+            vm = randomx_create_vm(vm_flags, cache, NULL);
             tls_seed_ver = g_rx_seed_ver;
         }
         pthread_mutex_unlock(&rx_lock);
@@ -668,16 +702,11 @@ static void* worker_thread(void* arg) {
             if (got != 0) {
                 hash_stub(j->header, nonce, hash);
             }
-            // simple compare: treat target as big-endian uint256; here we just check first byte for demo
+            // full 256-bit target comparison for correctness
             int ok = 0;
 #ifdef HAVE_RANDOMX
             if (j->flags & 0x01) {
-                if (j->target64) {
-                    uint64_t value = 0; memcpy(&value, hash + 24, 8);
-                    ok = (value < j->target64);
-                } else {
-                    ok = hash_meets_target(hash, j->target);
-                }
+                ok = hash_meets_target(hash, j->target);
             } else
 #endif
             {
@@ -1001,7 +1030,16 @@ static int listen_socket(const char *addr, int port) {
     struct sockaddr_in sa = {0};
     sa.sin_family = AF_INET;
     sa.sin_port = htons(port);
-    sa.sin_addr.s_addr = INADDR_ANY;
+    if (addr && *addr) {
+        struct in_addr ina;
+        if (inet_pton(AF_INET, addr, &ina) == 1) {
+            sa.sin_addr = ina;
+        } else {
+            sa.sin_addr.s_addr = htonl(INADDR_ANY);
+        }
+    } else {
+        sa.sin_addr.s_addr = htonl(INADDR_ANY);
+    }
     if (bind(s, (struct sockaddr*)&sa, sizeof(sa))<0){close(s);return -1;}
     if (listen(s, 8)<0){close(s);return -1;}
     return s;
@@ -1054,6 +1092,7 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--run-as") == 0 && i+1 < argc){ g_run_as_user = argv[++i]; }
         else if (strcmp(argv[i], "--chroot") == 0 && i+1 < argc){ g_chroot_dir = argv[++i]; }
         else if (strcmp(argv[i], "--no-new-privs") == 0){ g_no_new_privs = 1; }
+        else if (strcmp(argv[i], "--bind") == 0 && i+1 < argc){ g_bind_addr = argv[++i]; }
         #ifdef HAVE_OPENSSL
         else if (strcmp(argv[i], "--tls-cert") == 0 && i+1 < argc){ g_tls_cert = argv[++i]; }
         else if (strcmp(argv[i], "--tls-key") == 0 && i+1 < argc){ g_tls_key = argv[++i]; }
@@ -1083,7 +1122,7 @@ int main(int argc, char **argv) {
         g_tls_enabled = 1;
     }
     #endif
-    int ls = listen_socket("0.0.0.0", port);
+    int ls = listen_socket(g_bind_addr, port);
     if (ls<0){ perror("listen"); return 1; }
     // Apply sandbox after listening (to allow low ports) but before accept loop
     if (drop_privileges_and_sandbox() != 0) {
@@ -1097,16 +1136,16 @@ int main(int argc, char **argv) {
     // Reap children to avoid zombies
     signal(SIGCHLD, SIG_IGN);
 
-    printf("device daemon listening on :%d (handshake:%s, token:%s, workers:%s, max_batch:%s"
-    #ifdef HAVE_OPENSSL
+    printf("device daemon listening on %s:%d (handshake:%s, token:%s, workers:%s, max_batch:%s"
+#ifdef HAVE_OPENSSL
            ", tls:%s"
-    #endif
+#endif
            ")\n",
-           port, g_require_handshake?"on":"off", (g_auth_token&&*g_auth_token)?"set":"none",
+           g_bind_addr ? g_bind_addr : "*", port, g_require_handshake?"on":"off", (g_auth_token&&*g_auth_token)?"set":"none",
            (g_max_workers>0?"capped":"auto"), (g_max_batch>0?"capped":"unlimited")
-    #ifdef HAVE_OPENSSL
+#ifdef HAVE_OPENSSL
            , g_tls_enabled?"on":"off"
-    #endif
+#endif
     );
     for (;;) {
         int c = accept(ls, NULL, NULL);

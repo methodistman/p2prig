@@ -20,12 +20,27 @@ A monorepo for a peer-to-peer mining setup:
   ./xmrig/build/xmrig --stress --donate-level=0 --print-time=10
   ```
 
-- Cross-build ARM64 .deb for device-daemon: GPLv3 (see ).
+- Build/package instructions for device-daemon (Android aarch64 and Debian arm64/amd64): see `docs/PACKAGING.md`.
 
-- Run device-daemon on ARM64 target:
+- Run device-daemon on target:
   ```bash
-  sudo dpkg -i device-daemon_0.1.0_arm64.deb || sudo apt -f install
-  device_daemon 9000
+  # Android/Termux (aarch64, bionic):
+  dpkg -i deviced-<version>-arm64.deb  # installs /usr/bin/device-daemon
+  device-daemon --bind 127.0.0.1 -p 9000
+
+  # Native Linux (amd64):
+  sudo dpkg -i device-daemon-<version>-amd64.deb || sudo apt -f install
+  device-daemon --bind 127.0.0.1 -p 9000
+  ```
+
+- Example XMRig to UnMineable (SSL 443), with remote backend env:
+  ```bash
+  export P2PRIG_HOST=127.0.0.1
+  export P2PRIG_PORT=9000
+  xmrig -a rx -k \
+    -o stratum+ssl://rx.unmineable.com:443 \
+    -u TRX:TRzVcqTsDE1fr6XLmhKkoWMEJHojgwaxdH.worker1 \
+    -p x --threads=4
   ```
 
 - Protocol reference: see `docs/PROTOCOL.md`.

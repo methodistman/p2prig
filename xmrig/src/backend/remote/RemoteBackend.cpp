@@ -24,6 +24,7 @@
 
 #include "base/net/stratum/Job.h"
 #include "net/JobResults.h"
+#include "base/io/log/Tags.h"
 
 namespace xmrig {
 
@@ -87,6 +88,31 @@ static bool send_frame(int fd, uint8_t opcode, const uint8_t *payload, uint64_t 
     if (!send_all(fd, hdr, 8)) return false;
     if (!send_all(fd, &opcode, 1)) return false;
     if (plen) return send_all(fd, payload, static_cast<size_t>(plen));
+    return true;
+}
+
+static bool read_full(int fd, void *buf, size_t len) {
+    uint8_t *p = static_cast<uint8_t*>(buf);
+    size_t off = 0;
+    while (off < len) {
+        ssize_t r = ::read(fd, p + off, len - off);
+        if (r <= 0) return false;
+        off += static_cast<size_t>(r);
+    }
+    return true;
+}
+
+static bool recv_frame(int fd, uint8_t &opcode, std::vector<uint8_t> &payload) {
+    uint8_t hdr[8];
+    if (!read_full(fd, hdr, 8)) return false;
+    uint64_t len = 0; for (int i=0;i<8;i++){ len = (len<<8) | hdr[i]; }
+    if (len < 1 || len > ((1ULL<<22)+1)) return false; // cap ~4MB
+    if (!read_full(fd, &opcode, 1)) return false;
+    payload.clear();
+    if (len > 1) {
+        payload.resize(static_cast<size_t>(len-1));
+        if (!read_full(fd, payload.data(), payload.size())) return false;
+    }
     return true;
 }
 
@@ -230,7 +256,7 @@ void RemoteBackend::start(IWorker *, bool) {
     d->enabled = true;
     d->handshakeDone = true;
     d->profileName = String("remote");
-    LOG_INFO("%s remote connected to %s:%d (caps=0x%08x)", Tags::backend(), d->host.c_str(), d->port, scaps);
+    LOG_INFO("%s remote connected to %s:%d (caps=0x%08x)", Tags::miner(), d->host.c_str(), d->port, scaps);
 
     // Optional: read META_RESP if present (non-blocking quick peek)
     ::fcntl(d->sock, F_SETFL, O_NONBLOCK);
