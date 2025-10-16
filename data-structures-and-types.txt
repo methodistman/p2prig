@@ -1,0 +1,108 @@
+Data Structures and Types — XMRig (p2prig)
+
+Version: 2025-10-15
+Project: /home/gregory/CascadeProjects/p2prig
+Codebase: xmrig/
+
+
+# Overview
+- **Goal**: Concise reference of key types used by the miner: jobs, results, algorithms, backends, network, timing.
+- **Method**: Extracted directly from headers to ensure accuracy.
+
+
+# Core Utility Types
+- **`xmrig::String`** (`xmrig/src/base/tools/String.h`)
+  - Heap C-string wrapper with JSON, split, case ops.
+  - Key: `data()`, `size()`, `isEmpty()`, `toJSON()`.
+
+- **`xmrig::Buffer`** (`xmrig/src/base/tools/Buffer.h`)
+  - `using Buffer = std::vector<uint8_t>;`.
+
+- **`xmrig::Chrono`** (`xmrig/src/base/tools/Chrono.h`)
+  - Wall/steady clock helpers: `steadyMSecs()`, `currentMSecsSinceEpoch()`.
+
+- **`xmrig::Timer`** (`xmrig/src/base/tools/Timer.h`)
+  - Libuv timer wrapper: `start(timeout, repeat)`, `singleShot(timeout)`, `stop()`.
+
+
+# Algorithms
+- **`xmrig::Algorithm`** (`xmrig/src/base/crypto/Algorithm.h`)
+  - Identifies PoW algorithm family/variant.
+  - Enums: `Id` (e.g., `RX_0`, `GHOSTRIDER_RTM`, many CN variants), `Family` (RANDOM_X, GHOSTRIDER, CN, ARGON2, KAWPOW).
+  - Helpers: `family()`, `name()`, `toJSON()`, `parse()`, cache hints `l2()`, `l3()`, intensity bounds.
+  - Alias: `using Algorithms = std::vector<Algorithm>;`.
+
+
+# Job and Results
+- **`xmrig::Job`** (`xmrig/src/base/net/stratum/Job.h`)
+  - Holds mining inputs/parameters.
+  - Important fields:
+    - `Algorithm m_algorithm`
+    - `Buffer m_seed`
+    - `uint8_t m_blob[kMaxBlobSize]`
+    - `uint64_t m_diff, m_height, m_target`
+    - `String m_clientId, m_id, m_poolWallet, m_extraNonce`
+    - `uint32_t m_backend`; `uint8_t m_index`
+  - Accessors: `algorithm()`, `blob()`, `size()`, `nonce()`, `nonceSize()`, `nonceOffset()`, `diff()`, `height()`, `target()`.
+  - Mutators: `setBlob()`, `setSeedHash()`, `setTarget()`, `setDiff()`, `setAlgorithm()`.
+
+- **`xmrig::JobResult`** (`xmrig/src/net/JobResult.h`)
+  - Solution record sent to pools.
+  - Public fields: `Algorithm algorithm`, `uint8_t index`, `String clientId`, `String jobId`, `uint32_t backend`, `uint64_t nonce`, `uint64_t diff`.
+  - Buffers: `result[32]`, optional `headerHash[32]`, `mixHash[32]`, optional `minerSignature[64]`.
+  - Helper: `actualDiff()`.
+
+- **`xmrig::SubmitResult`** (`xmrig/src/base/net/stratum/SubmitResult.h`)
+  - Per-submit telemetry: `reqId`, `seq`, `backend`, `actualDiff`, `diff`, `elapsed` with `done()`.
+
+- **`xmrig::JobResults`** (`xmrig/src/net/JobResults.{h,cpp}`)
+  - Static facade managing async dispatch of `JobResult` to `Network`.
+  - API: `setListener()`, `submit()`, `stop()`, `done()`.
+
+
+# Network Layer
+- **`xmrig::Pool`** (`xmrig/src/base/net/stratum/Pool.h`)
+  - Endpoint, credentials, TLS/SNI, Nicehash flag, daemon settings.
+  - Key: `algorithm()`, `host()`, `port()`, `user()`, `password()`, `isTLS()`, `createClient()`.
+
+- **`xmrig::NetworkState`** (`xmrig/src/base/net/stratum/NetworkState.h`)
+  - Connection/results state: `Algorithm`, accepted/rejected, latency samples, fingerprint/IP/TLS.
+  - API (API feature): `getConnection()`, `getResults()`.
+
+- **`xmrig::IClient`** (`xmrig/src/base/kernel/interfaces/IClient.h`)
+  - Stratum client interface.
+  - Key ops: `connect()`, `send(...)`, `submit(JobResult)`, `setAlgo()`, `tick(now)`, metadata (TLS version, fingerprint, IP).
+
+- **`xmrig::IStrategy`** (`xmrig/src/base/kernel/interfaces/IStrategy.h`)
+  - Strategy abstraction for pool orchestration.
+  - Key ops: `connect()`, `resume()`, `submit()`, `setAlgo()`, `stop()`, `tick(now)`, `client()`.
+
+
+# Backends and Metrics
+- **`xmrig::IBackend`** (`xmrig/src/backend/common/interfaces/IBackend.h`)
+  - Contract for CPU/OpenCL/CUDA/Remote.
+  - Methods: `isEnabled()`, `isEnabled(Algorithm)`, `prepare(Job)`, `setJob(Job)`, `start(IWorker*,ready)`, `stop()`, `tick()`, `hashrate()`, `toJSON()` (API).
+
+- **`xmrig::Hashrate`** (`xmrig/src/backend/common/Hashrate.h`)
+  - Rolling hashrate buckets and averages.
+  - Ops: `add(...)`, `calc(ms)`, `average()`, `toJSON()`.
+
+- **`xmrig::HashrateInterpolator`** (`xmrig/src/backend/common/HashrateInterpolator.h`)
+  - Interpolates hashrate with a short lag buffer (`LagMS = 4000`).
+
+- **`xmrig::RemoteBackend`** (`xmrig/src/backend/remote/RemoteBackend.h`)
+  - Implements `IBackend`; uses opaque `RemoteBackendPrivate` for sockets, threads, job/batch state.
+  - See remote protocol doc `summary-of-operation-and-intent-a-distributed-platform.txt`.
+
+
+# Core Control Plane
+- **`xmrig::Controller`** (`xmrig/src/core/Controller.h`)
+  - Owns `Miner`, `Network` (and `HwApi` if enabled). Lifecycle: `init()`, `start()`, `stop()`.
+
+- **`xmrig::Miner`** (`xmrig/src/core/Miner.h`)
+  - Owns vector of `IBackend*`, exposes `algorithms()`, `setJob(job, donate)`, CLI/API hooks, timer listener.
+
+
+# Notes
+- Sizes/endianness for network frames exist in RemoteBackend implementation; see protocol doc.
+- RandomX-specific datasets/VMs are managed inside GPU/CPU backends and `JobResults.cpp` (for verification in GPU builds).

@@ -1,0 +1,79 @@
+Distributed Compute + Mining Platform Plan (RandomX & GhostRider)
+
+Version: 2025-10-15
+Project: /home/gregory/CascadeProjects/p2prig
+Codebase: xmrig/
+
+
+# Objective
+- Build a distributed platform that mines RandomX and GhostRider during idle cycles while executing our own compute tasks.
+- Keep PoW semantics intact (pool-verifiable). Use co-scheduling/time-slicing instead of altering hashing algorithms.
+
+
+# Constraints
+- Do not modify RandomX/GhostRider kernels or result formats.
+- Compute tasks must be sandboxed and resource-capped.
+- Heterogeneous remotes; capacity varies per device.
+
+
+# Architecture (Additions on top of XMRig)
+- Scheduler (new): decides CPU/GPU shares for mining vs compute, based on idleness and SLAs.
+- ComputeManager (new): task queue, dispatch, result aggregation.
+- Remote Orchestrator (extend `backend/remote/RemoteBackend.{h,cpp}`): dispatch mining slices and compute tasks; track per-remote capacity.
+- Worker Agent (server-side): executes compute tasks and mining slices; reports telemetry.
+- API (extend `base/api`): surfaces queues, rates, capacities, controls.
+
+
+# Protocol v2 (extends current Remote)
+- Capabilities (SERVER_HELLO caps):
+  - 0x01 mining (current), 0x02 leasing (current), 0x04 compute tasks, 0x08 secure sandbox.
+- New opcodes:
+  - 0x50 TASK_SUBMIT: 'X','C',v1, task_id(8BE), type(1), prio(1), est_ms(4BE), len(4BE), payload…
+  - 0x51 TASK_ABORT: task_id(8BE)
+  - 0x52 TASK_RESULT: task_id(8BE), status(1), elapsed_ms(4BE), len(4BE), result…
+  - 0x53 TASK_PROGRESS (optional): task_id(8BE), pct(1), eta_ms(4BE)
+  - 0x02 META_RESP (already used): extend JSON with compute info: cores, mem_mb, gpu, rx, gr, max_concurrent
+
+
+# Scheduling Policy (CPU/GPU/Remote)
+- Idle detection: system load < threshold over N seconds → allocate share to compute.
+- Partitioning:
+  - CPU: dynamic M compute workers vs N mining threads.
+  - GPU: lower miner intensity during compute bursts; short kernels to avoid watchdogs.
+  - Remote: track `effectiveBatch` (mining) and `effectiveTaskSlots` (compute) via EWMA of durations.
+- Preemption: allow compute to yield to new jobs; and allow mining to yield for critical compute SLAs.
+
+
+# Integration Points
+- `core/Miner.{h,cpp}`: host `ComputeManager`; expose hooks to adjust backend intensity.
+- `backend/remote/RemoteBackend.{h,cpp}`: extend handshake caps; implement TASK_* send/recv; per-remote compute queues; keep XJ/XL/RESULT/DONE unchanged.
+- `net/JobResults.{h,cpp}`: unchanged for mining; add parallel `TaskResults` (new) for compute.
+- `base/api/*`: endpoints for queues, rates, capacities, and toggles.
+
+
+# Worker Agent (server-side)
+- Advertise caps; accept mining slices and TASK_*.
+- Run compute in sandbox (container/jail/WASM) with CPU/mem/GPU limits; report progress/result.
+
+
+# RandomX & GhostRider Co-Scheduling
+- RandomX: reduce mining threads during compute; pin compute to separate cores; preserve dataset/VM invariants.
+- GhostRider: adjust GPU intensity; use separate streams/queues for compute kernels; keep mining kernels short.
+
+
+# Security
+- TLS for transport; token→HMAC or mTLS.
+- Signed tasks; sandboxed execution; audit logs.
+
+
+# Telemetry & Controls
+- Metrics: mining hashrate, shares; compute throughput, queue depth, duration percentiles; per-remote utilization/RTT.
+- Controls: enable/disable compute, idle thresholds, CPU/GPU share caps, per-remote weights.
+
+
+# Milestones
+- M1: Protocol v2 (caps + TASK_SUBMIT/RESULT); Worker Agent MVP; single-remote demo.
+- M2: Scheduler + ComputeManager; CPU-only co-scheduling; API endpoints.
+- M3: GPU co-scheduling (GhostRider); per-remote EWMA tuning; backpressure.
+- M4: TLS/mTLS; signed tasks; sandbox hardening.
+- M5: Multi-remote scaling; dashboards; autoscaling policies.

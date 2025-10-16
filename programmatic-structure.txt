@@ -1,0 +1,114 @@
+Programmatic Structure — XMRig (p2prig fork)
+
+Version: 2025-10-15
+Project root: /home/gregory/CascadeProjects/p2prig
+Primary codebase: xmrig/
+
+
+# 1. Entry and Boot
+- **`xmrig/src/xmrig.cpp`**
+  - `main()` → constructs `xmrig::Process`, resolves `Entry::Id` via `Entry::get(process)`; if not a special entry, constructs `xmrig::App` and calls `App::exec()`.
+- **`xmrig/src/App.{h,cpp}`**
+  - Owns: `Controller`, `Console`, `Signals`.
+  - Flow: validate config → `Controller::init()` → print `Summary` → `Controller::start()` → `uv_run()`.
+- **`xmrig/src/base/kernel/Entry.h`**
+  - Alternate entry paths (Usage, Version, Topo, Platforms).
+
+
+# 2. Core Control Plane
+- **`xmrig/src/core/Controller.{h,cpp}`**
+  - Constructs and owns `Miner` and `Network`.
+  - Initializes `VirtualMemory` and API listeners (if enabled).
+  - `start()` creates `Miner` then `network()->connect()`.
+  - `execCommand(char)` forwards to `Miner` and `Network`.
+- **`xmrig/src/core/Miner.{h,cpp}`**
+  - Owns vector of `IBackend` (CPU, OpenCL, CUDA, Remote when available).
+  - Maintains active `Job`, selected `Algorithm`, timers, and aggregated hashrate.
+  - On job update: `prepare(job)` then `setJob(job)` on each backend; manages RandomX dataset readiness.
+  - CLI commands: print hashrate/health, pause/resume.
+
+
+# 3. Network Plane
+- **`xmrig/src/net/Network.{h,cpp}`**
+  - Registers as `JobResults` listener: `JobResults::setListener(this, cpu.isHwAES())`.
+  - Builds `IStrategy` from pools (`base/net/stratum/Pools`).
+  - Receives jobs (`onJob`) and forwards to `Miner::setJob(job, donate)`.
+  - Receives results (`onJobResult`) and submits to the active strategy (pool JSON-RPC).
+  - Periodic tick via `Timer` for strategy, donation, and API.
+- **Stratum and tools**: `xmrig/src/base/net/stratum/` (clients, TLS, socks5, URLs, state, submit results) and `xmrig/src/base/net/*` (dns/http/https/tls, tools).
+
+
+# 4. Backends
+- **Interface**: `xmrig/src/backend/common/interfaces/IBackend.h`
+  - Methods to implement: `isEnabled()`, `isEnabled(const Algorithm&)`, `prepare(const Job&)`, `setJob(const Job&)`, `start(IWorker*, bool)`, `stop()`, `tick(uint64_t)`, `hashrate()`, `toJSON()` (API), `printHashrate()`, `printHealth()`.
+- **CPU**: `xmrig/src/backend/cpu/*` (local threads, CPU-specific tuning).
+- **OpenCL**: `xmrig/src/backend/opencl/*` (guarded by `XMRIG_FEATURE_OPENCL`).
+- **CUDA**: `xmrig/src/backend/cuda/*` (guarded by `XMRIG_FEATURE_CUDA`).
+- **Remote (experimental)**: `xmrig/src/backend/remote/RemoteBackend.{h,cpp}` (guarded by `XMRIG_FEATURE_REMOTE`).
+  - Adds distributed execution path via TCP protocol, reconnect/backoff, optional multi-remote fan-out.
+  - See `summary-of-operation-and-intent-a-distributed-platform.txt` for protocol and runtime details.
+
+
+# 5. Jobs and Results
+- **Job**: `xmrig/src/base/net/stratum/Job.{h,cpp}`
+  - Encapsulates algorithm, blob, nonce offsets/sizes, difficulty/target, height, RandomX seed, helpers.
+- **Result Aggregation**: `xmrig/src/net/JobResults.{h,cpp}`
+  - Global handler (`JobResultsPrivate`) that queues results and dispatches to `Network::onJobResult()` (GPU builds may verify in a background UV task).
+- **Submission to pools**: `Network::onJobResult()` → `IStrategy::submit(result)` → pool JSON-RPC.
+
+
+# 6. Base Subsystems
+- **Kernel**: `xmrig/src/base/kernel/*` — `Process`, `Platform` (priority, system info), `Entry`, `Timer`.
+- **IO**: `xmrig/src/base/io/*` — `Console`, `Signals`, logging (`Log`, `Tags`), JSON.
+- **API**: `xmrig/src/base/api/*` (if `XMRIG_FEATURE_API`) — HTTP API (`Api`, `Httpd`), request plumbing and listeners.
+- **Tools**: `xmrig/src/base/tools/*` — utility modules (buffers, chrono, cryptonote, conversions, alignment).
+
+
+# 7. Crypto Subsystem
+- **Algorithms**: `xmrig/src/base/crypto/Algorithm.h` (IDs, family, params).
+- **Family implementations**:
+  - RandomX: `xmrig/src/crypto/rx/*`.
+  - CryptoNight: `xmrig/src/crypto/cn/*`.
+  - KawPow: `xmrig/src/crypto/kawpow/*`.
+  - GhostRider: `xmrig/src/crypto/ghostrider/*`.
+
+
+# 8. Configuration
+- **`xmrig/src/core/config/Config.{h,cpp}`**
+  - Inherits `BaseConfig`; exposes CPU/OpenCL/CUDA/RandomX sections and global settings (idle, pause on battery, print intervals).
+  - Pools config drives `IStrategy` creation in `Network`.
+- **Remote backend runtime**: currently driven by env vars (e.g., `P2PRIG_HOST`, `P2PRIG_PORT`, `P2PRIG_ENDPOINTS`, `P2PRIG_TOKEN`, `P2PRIG_BATCH`, tuning envs). See remote summary doc.
+
+
+# 9. Logging and Summary
+- **Logging**: `xmrig/src/base/io/log/*` — `Log`, `FileLogWriter`, `Tags` used across modules including RemoteBackend.
+- **Startup summary**: `xmrig/src/Summary.{h,cpp}`.
+
+
+# 10. Threading Model
+- **Event loop**: Single libuv loop in `App::exec()` for network/API.
+- **Backends**: CPU/GPU worker threads; Remote backend rx thread(s) per connection.
+- **Synchronization**: mutexes for backend send paths, nonce allocator in Remote multi-remote; atomics for timestamps and stop flags.
+
+
+# 11. Build Features and Flags
+- Compile-time feature flags used per backend/subsystem:
+  - `XMRIG_FEATURE_REMOTE`, `XMRIG_FEATURE_API`, `XMRIG_FEATURE_OPENCL`, `XMRIG_FEATURE_CUDA`, `XMRIG_ALGO_RANDOMX`, `XMRIG_ALGO_KAWPOW`, etc.
+- Platform abstractions under `base/kernel/Platform_*`.
+
+
+# 12. Key Call Flows (high level)
+- Boot: main → App → Controller.init → Controller.start → Miner + Network.connect → uv loop.
+- Job: Network.onJob → Miner.prepare/setJob → Backends compute/submit.
+- Result: Backend → JobResults → Network.onJobResult → Strategy.submit → Pool.
+
+
+# 13. Notable Files and Directories (quick index)
+- Entry: `xmrig/src/xmrig.cpp`, `xmrig/src/App.{h,cpp}`.
+- Core: `core/Controller.{h,cpp}`, `core/Miner.{h,cpp}`.
+- Network: `net/Network.{h,cpp}`, `base/net/stratum/*`.
+- Backends: `backend/cpu/*`, `backend/opencl/*`, `backend/cuda/*`, `backend/remote/RemoteBackend.{h,cpp}`.
+- Job/Results: `base/net/stratum/Job.{h,cpp}`, `net/JobResults.{h,cpp}`.
+- Base: `base/kernel/*`, `base/io/*`, `base/api/*`, `base/tools/*`.
+- Crypto: `base/crypto/Algorithm.h`, `crypto/**`.
+- 3rdparty: `3rdparty/**` (rapidjson, hwloc, fmt, etc.).

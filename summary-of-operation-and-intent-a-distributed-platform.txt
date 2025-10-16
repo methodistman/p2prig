@@ -1,0 +1,256 @@
+Summary of Operation and Intent — A Distributed Platform
+
+Version: 2025-10-15
+Project root: /home/gregory/CascadeProjects/p2prig
+Primary module analyzed: xmrig (with XMRIG_FEATURE_REMOTE)
+
+
+# Executive Summary
+- Intent: Extend XMRig with an experimental Remote Backend to delegate mining work to one or more remote devices via a lightweight binary protocol over TCP.
+- Scope: Adds a new backend (`remote`) that coexists with CPU/GPU backends. It supports:
+  - Single-remote mode using env `P2PRIG_HOST`, `P2PRIG_PORT`, optional `P2PRIG_TOKEN`.
+  - Multi-remote mode using env `P2PRIG_ENDPOINTS` (comma-separated `host:port[:weight]`).
+  - Automatic reconnect with exponential backoff (no goto), initial handshake validation, non-blocking meta peek, and adaptive batch sizing based on device feedback.
+- Transport: Plain TCP with length-prefixed frames, big-endian numeric fields in payloads where applicable. No TLS in this version.
+- Protocol highlights: CLIENT_HELLO/SERVER_HELLO handshake, optional META_RESP JSON, JOB_SUBMIT (XJ), SLICE_LEASE_REQ (XL), RESULT, DONE, SLICE_DONE_EXT, and PING/PONG.
+
+
+# High-Level Architecture
+- Entry: `xmrig/src/xmrig.cpp` boots an `xmrig::App` which wires core services.
+- Control plane:
+  - `xmrig::Controller` (`xmrig/src/core/Controller.cpp`) creates a `Network` (Stratum/pools) and a `Miner`.
+  - `xmrig::Miner` (`xmrig/src/core/Miner.cpp`) constructs enabled backends. When `XMRIG_FEATURE_REMOTE` is defined, it adds `xmrig::RemoteBackend` to the backend list.
+- Data plane:
+  - On new jobs, `Miner::setJob()` calls `IBackend::setJob()` on each backend, including `RemoteBackend`, which builds and transmits the job frames to its remote(s).
+
+
+# Remote Backend Overview
+File: `xmrig/src/backend/remote/RemoteBackend.cpp`
+Class: `xmrig::RemoteBackend` (interface in `RemoteBackend.h`)
+Private state holder: `RemoteBackendPrivate`
+
+- Core fields (single-remote mode):
+  - `host`, `port`, `token`: remote endpoint and optional token from env.
+  - `sock`: POSIX socket fd.
+  - `handshakeDone`: set after a valid SERVER_HELLO.
+  - `rxThread`: background reader/reconnect thread.
+  - `jobCopy`: last job set by `Miner` for resubmission after reconnects.
+  - `nextJobId`, `jobId`: monotonically increasing job IDs issued locally.
+  - `nonceNext`, `batchSize`: current nonce start and batch size per submission.
+  - `deviceCpuCount`, `deviceMaxBatch`: optional metadata from META_RESP to size batches.
+  - `sendMtx`: mutex protecting send operations to serialize writes.
+  - `lastRxMs`, `lastPingMs`: timestamps for status/telemetry.
+
+- Multi-remote mode (`RemoteBackendPrivate::RemoteConn`):
+  - One `RemoteConn` per endpoint with its own `sock`, `handshakeDone`, `rxThread`, `sendMtx`.
+  - `weight` influences effective batch scaling relative to base `batchSize`.
+  - `caps` bitfield from server hello; `lease` flag enabled if server indicates slicing/lease capability.
+  - `effectiveBatch` dynamically tuned using EWMA of slice durations relative to target.
+  - `jobId`, `nextNonce`, `nextSliceId`: per-remote submission tracking.
+  - `globalNonceNext` with `allocMtx` coordinates unique, non-overlapping nonce ranges across remotes.
+
+- Enablement: Remote backend is disabled unless minimal env is present.
+  - Single-remote: requires `P2PRIG_HOST` and `P2PRIG_PORT`.
+  - Multi-remote: `P2PRIG_ENDPOINTS` (e.g., `host1:9000:2,host2:9001:1`). Shared token via `P2PRIG_TOKEN`.
+
+
+# Runtime Configuration (Environment)
+- `P2PRIG_HOST`: host (single-remote).
+- `P2PRIG_PORT`: port (single-remote).
+- `P2PRIG_TOKEN`: ASCII token transmitted in CLIENT_HELLO payload. Optional.
+- `P2PRIG_ENDPOINTS`: multi-remote list `host:port[:weight]` (comma-separated).
+- `P2PRIG_BATCH`: base batch size (uint). Used as initial per-submit nonce count; may be overridden by remote `max_batch`.
+- `P2PRIG_TUNE_TARGET_MS`: target slice duration (double, default ~800 ms) for adaptive tuning.
+- `P2PRIG_TUNE_STEP_PCT`: percentage step for increasing/decreasing `effectiveBatch` (default ~10%).
+
+
+# Wire Protocol
+Transport: TCP. Frame structure:
+- 8-byte big-endian unsigned length L = 1 + payload_size
+- 1-byte opcode
+- payload of size (L - 1) if L > 1
+
+Opcodes observed in code:
+- 0x30 CLIENT_HELLO
+- 0x31 SERVER_HELLO
+- 0x02 META_RESP (JSON string payload)
+- 0x10 JOB_SUBMIT (extended job: “XJ”)
+- 0x11 JOB_ABORT
+- 0x12 RESULT
+- 0x13 DONE
+- 0x20 PING
+- 0x21 PONG
+- 0x40 SLICE_LEASE_REQ (extended slice: “XL”)
+- 0x41 SLICE_ACK
+- 0x43 SLICE_DONE_EXT
+- 0x7F ERROR
+
+Handshake:
+- Client sends CLIENT_HELLO payload:
+  - ver (uint16 BE, currently 1), caps (uint32 BE), token_len (uint16 BE), token bytes (optional)
+- Server must respond with SERVER_HELLO; code requires payload size >= 2+4+1 (at least ver + caps + one more byte). If not satisfied or opcode unexpected, the client drops and backs off.
+- Capabilities: `r->caps` set from SERVER_HELLO payload; `lease` is enabled if `(caps & 0x2u) != 0`.
+
+Optional metadata:
+- META_RESP (opcode 0x02), payload is UTF-8 JSON:
+  - Known keys: `cpu_count` (int), `max_batch` (uint)
+  - The client reads this opportunistically using a non-blocking recv-frame shortly after connect.
+
+Job submission (extended “XJ”): opcode 0x10
+- Payload layout:
+  - ASCII bytes: 'X', 'J'
+  - version: 1 byte (value 1)
+  - jobId: 8 bytes big-endian
+  - rxFlag: 1 byte (0x01 for RandomX family, else 0x00)
+  - nonceSize: 1 byte
+  - nonceOffset: 4 bytes big-endian
+  - blobLen: 4 bytes big-endian
+  - blob: blobLen bytes
+  - nonceStart: 8 bytes big-endian
+  - nonceCount: 4 bytes big-endian (batch size)
+  - target32: 32 zero bytes (placeholder if target64 present)
+  - target64: 8 bytes big-endian
+  - if rxFlag==1: seed (32 bytes), height (4 bytes big-endian)
+
+Job abort: opcode 0x11
+- Payload: jobId (8 bytes big-endian)
+
+Slice/lease submission (extended “XL”): opcode 0x40 (when `lease==true`)
+- Payload layout:
+  - ASCII 'X', 'L', version (1)
+  - sliceId: 8 bytes big-endian (monotonic per-remote)
+  - jobId: 8 bytes big-endian
+  - rxFlag: 1 byte
+  - nonceSize: 1 byte
+  - nonceOffset: 4 bytes big-endian
+  - blobLen: 4 bytes big-endian
+  - blob: blobLen bytes
+  - nonceStart: 8 bytes big-endian
+  - nonceCount: 4 bytes big-endian
+  - target32: 32 zero bytes
+  - target64: 8 bytes big-endian
+  - if rxFlag==1: seed (32), height (4 BE)
+
+Results and completion:
+- RESULT (0x12):
+  - Payload: jobId (8 BE), nonce (8 BE), solution (32 bytes)
+  - Action: if jobId matches current, submit via `JobResults::submit(jobCopy, nonce, solution_ptr)`
+- DONE (0x13):
+  - Payload: jobId (8 BE), processed (8 BE)
+  - Action: in single-remote mode, auto-submit the next batch by incrementing `nonceNext` by `batchSize` and resending XJ.
+- SLICE_DONE_EXT (0x43):
+  - Payload contains jobId and extended timing fields; code extracts duration ms and updates EWMA. It recalculates `effectiveBatch` using target and step pct and clips to [1, deviceMaxBatch]. Then it computes the next nonce range from `globalNonceNext` and submits a new XL slice.
+
+Heartbeat:
+- PING (0x20) → respond with PONG (0x21). Timestamps recorded in `lastPingMs`.
+
+
+# Control Flow and Threading
+Single-remote mode
+- `RemoteBackend::start()` reads env (`P2PRIG_HOST/PORT/TOKEN`), sets `enabled=true`, spawns `rxThread`.
+- Initial connect loop:
+  - Resolve with `getaddrinfo`, connect, send CLIENT_HELLO, expect SERVER_HELLO; on success set `sock`, `handshakeDone=true`.
+  - Non-blocking one-shot `recv_frame` to opportunistically read META_RESP.
+  - If there’s a saved `jobCopy`, immediately send a fresh XJ.
+- Read loop:
+  - Blocking `recv_frame` dispatches RESULT, DONE (auto-resubmit), PING (reply PONG). On I/O failure:
+    - Close socket, reset `handshakeDone`, enter reconnect loop with exponential backoff (1,2,4,...,30s).
+    - On re-handshake success, optionally meta-peek and resubmit the latest job.
+
+Multi-remote mode
+- If `P2PRIG_ENDPOINTS` is set, `start()` builds vector of `RemoteConn` objects and spawns one thread per remote.
+- Each remote thread:
+  - Connects and handshakes similarly to single-remote, but also reads `caps` to enable lease mode.
+  - Performs non-blocking META peek for `deviceMaxBatch` and `cpu_count`.
+  - If a job is available, computes `effectiveBatch` from `batchSize * weight` and caps by `deviceMaxBatch`. It allocates a nonce range via `globalNonceNext` and submits XJ or XL based on `lease`.
+  - Read loop processes RESULT, SLICE_ACK (no-op), SLICE_DONE_EXT/DONE to adapt `effectiveBatch`, allocate a new nonce range, and submit the next slice.
+
+Synchronization
+- `sendMtx` per connection serializes writes.
+- `allocMtx` in `RemoteBackendPrivate` protects `globalNonceNext` allocation, ensuring non-overlapping nonce ranges across remotes.
+- Atomics (`stopRx`, `lastRxMs`, `lastPingMs`, per-remote `stop`) coordinate thread termination and telemetry updates.
+
+Lifecycle and cleanup
+- `RemoteBackend::stop()` sets stop flags, joins threads, closes sockets, resets state. Multi-remote threads are joined individually.
+
+
+# Job Model and Integration
+- Job source: `xmrig::Miner` creates and updates the active `xmrig::Job` from Stratum/network events (`xmrig/src/base/net/stratum/Job.cpp`).
+- On job change, `Miner` calls `backend->prepare(job)` then `backend->setJob(job)`.
+- `RemoteBackend::setJob()` behavior:
+  - Multi-remote: aborts any in-flight remote job, recomputes `effectiveBatch` and `nextNonce` per remote (using weights and device limits), sends XJ or XL to each connected remote.
+  - Single-remote: aborts previous job if needed, sets a new `jobId`, sends XJ built from the current `jobCopy`, current `nonceNext`, and `batchSize`.
+
+
+# Backoff and Resiliency
+- Exponential backoff used on DNS resolution failures and connect failures, capped at 30 seconds. The initial backoff resets to 1 second after a successful handshake.
+- Read failures trigger a full reconnect attempt loop. No `goto` is used; loops and `continue` statements implement control flow and scope boundaries ensure variable lifetimes are respected.
+
+
+# Adaptive Throughput (Multi-remote)
+- Feedback-driven `effectiveBatch` tuning uses EWMA of observed slice duration (`doneEwmaMs`).
+- Target duration (`P2PRIG_TUNE_TARGET_MS`, default 800 ms). If EWMA < 0.9×target, increase batch by `stepPct`; if > 1.1×target, decrease by `stepPct`. Values are clamped to [1, `deviceMaxBatch`] when known.
+
+
+# Security Considerations
+- Transport is plaintext TCP; no TLS. Tokens (if used) are sent unencrypted.
+- Token mechanism is a simple opaque string; server-side validation/auth is outside client scope.
+- Recommendation: add TLS and mutual authentication for production environments.
+
+
+# Logging and Telemetry
+- Uses `base/io/log/Log.h` and `Tags::miner()` for consistent log prefixing.
+- `toJSON()` endpoint (when `XMRIG_FEATURE_API`) exposes remote status, host/port, batch, handshake state, device metadata, last RX/ping ages, and detailed per-remote state.
+
+
+# Build-Time Flags
+- `XMRIG_FEATURE_REMOTE` must be enabled to compile the remote backend. Other features (CPU, CUDA, OpenCL) are independent and continue to operate normally.
+
+
+# Known Limitations and Future Work
+- No TLS or certificate pinning.
+- No jitter/randomization in backoff (risk of thundering herd if many clients reconnect simultaneously).
+- No built-in rate limiting on RESULT/DONE processing.
+- Hashrate accounting is not integrated with RemoteBackend yet.
+- Config relies on environment variables; a proper config schema/UI would be beneficial.
+- Consider adding:
+  - TLS and token-based auth with HMAC or JWT.
+  - Retry jitter, backoff floor/ceiling controls, and circuit-breaking.
+  - Structured metrics for API (per-remote EWMA, error counters, submit latency distribution).
+  - Unified lease/submit queues with prioritization.
+
+
+# Usage Examples
+Single-remote
+- Environment:
+  - `export P2PRIG_HOST=127.0.0.1`
+  - `export P2PRIG_PORT=9000`
+  - `export P2PRIG_TOKEN=example-token` (optional)
+  - `export P2PRIG_BATCH=1048576` (optional)
+- Run: `./xmrig/build/xmrig ...` (standard XMRig CLI/pool config still applies; RemoteBackend submits received jobs to the remote device.)
+
+Multi-remote
+- Environment:
+  - `export P2PRIG_ENDPOINTS="10.0.0.2:9000:2,10.0.0.3:9000:1"`
+  - `export P2PRIG_TOKEN=shared-token` (if the server requires it)
+  - `export P2PRIG_TUNE_TARGET_MS=800` (optional)
+  - `export P2PRIG_TUNE_STEP_PCT=10` (optional)
+- Run: `./xmrig/build/xmrig ...`
+
+
+# File and Symbol References
+- Process startup: `xmrig/src/xmrig.cpp`
+- Controller and miner wiring: `xmrig/src/core/Controller.cpp`, `xmrig/src/core/Miner.cpp`
+- Remote backend (implementation): `xmrig/src/backend/remote/RemoteBackend.cpp`
+- Remote backend (interface): `xmrig/src/backend/remote/RemoteBackend.h`
+- Job model: `xmrig/src/base/net/stratum/Job.cpp`
+- Result submission: `xmrig/src/net/JobResults.h` (used via `JobResults::submit()`)
+
+
+# Intent Recap
+The Remote Backend adds a distributed execution path to XMRig without disrupting local CPU/GPU mining. It provides:
+- A minimal, explicit binary protocol for job submission and results.
+- Robust reconnect handling free of undefined behavior (no `goto` crossing initializations).
+- Optional multi-remote scaling with per-remote adaptive tuning and centralized nonce allocation.
+
+This establishes a foundation for a distributed mining platform that can scale across heterogeneous remote devices while maintaining tight control over work partitioning and feedback-driven performance tuning.
