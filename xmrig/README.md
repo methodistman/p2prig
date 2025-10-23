@@ -133,3 +133,26 @@ Remote backend details appear in `GET /2/backends` under `type: "remote"`, inclu
 - RandomX huge pages (including 1 GB if available) significantly improve performance.
 - The PeerServer reports a running connection counter; it may represent total accepts rather than current live connections depending on your version.
 - The protocol is evolving; current implementation supports handshake, `JOB_SUBMIT` (XJ), slice lease (XL), `RESULT`, `DONE`, `SLICE_DONE_EXT`, and `JOB_ABORT`.
+
+## CLI UI (Terminal)
+
+This repository includes a simple Bash-based terminal UI to monitor the miner and peer status using the built-in HTTP API.
+
+- Script: `tools/peer_ui.sh`
+- Requirements: `bash`, `curl`, `python3`, `ss` (iproute2)
+
+Usage:
+
+```bash
+./tools/peer_ui.sh -p 8082 --peer-port 8080
+./tools/peer_ui.sh -p 8082 --watch 2
+```
+
+Displayed fields:
+
+- Processors (CPU thread table)
+- Token and full user being mined (parsed from `-u` argument)
+- Hashrate (10s, 60s) and Total hashrate
+- Estimated RandomX dataset size, RAM free/total
+- Peer server status (enabled/bind/port/connections)
+- Remote backend status and connected remotes (when enabled via env)
