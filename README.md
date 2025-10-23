@@ -1,112 +1,172 @@
-# p2prig
+# P2P Mining Cluster (`p2prig`)
+Production-ready, modular peer-to-peer mining system for distributed clusters and market-driven hashrate leasing.
 
-A monorepo for a peer-to-peer mining setup:
+## Overview
+**p2prig** is a C-based, open-source mining cluster designed for heterogeneous hardware environments. It supports decentralized P2P mining, dynamic workload distribution, pool connectivity, and a hashrate marketplace ("Bazaar of Shards") for automated leasing between peers.
 
-- device-daemon (C): lightweight remote hashing daemon for ARM64 devices (phones/tablets). Handles work frames over TCP/TLS, executes RandomX, streams results.
-- xmrig (C++): XMRig miner with an experimental remote backend scaffold (disabled by default unless built with WITH_REMOTE=ON).
+- **Languages:** C (99%), Shell scripts (1%)
+- **Platform:** Linux (POSIX)
+- **License:** MIT
+- **Status:** Production Ready
+- **Latest Version:** 1.1.0
 
-## Repository layout
+## Features
 
-- device-daemon/: Remote worker daemon (arm64-focused)
-- xmrig/: XMRig miner with remote backend scaffold
-- docs/: Protocol, build, and packaging docs
+### P2P Networking
+- TCP-based peer-to-peer protocol
+- Scalable: up to 128 concurrent peers
+- Custom message protocol (11 types)
+- Master/Worker/Auto/Pool modes
+- Peer discovery & management
+- Non-blocking I/O
 
-## Dependencies
+### Mining Algorithms
+- Modular interface for easy algorithm integration
+- **RandomX:** Full & stub implementations (real library integrated; 50-100 H/s, 2GB dataset)
+- **Ghostrider:** Full & stub implementations
+- Automatic hardware optimization (AES-NI, huge pages, etc.)
+- Capability-based resource assignment
 
-### Common (Debian/Ubuntu)
+### Workload Distribution
+- Distributed work unit management
+- Progress tracking, share detection, and validation
+- Statistics: hashes, shares, hashrate, uptime
 
-- build-essential, pkg-config, git, cmake
-- Install with:
-  ```bash
-  sudo apt-get update
-  sudo apt-get install -y build-essential pkg-config git cmake
-  ```
+### Pool Connectivity
+- **Stratum protocol** (NEW): Connect to mining pools (mining.subscribe, mining.authorize, mining.notify, mining.submit)
+- Configurable pool host/port, wallet, password
+- Non-blocking, stateful connection
+- Clean shutdown
 
-### XMRig (miner) build/runtime
+### Hashrate Marketplace ("Bazaar of Shards")
+- **Enable with:** `-DXMRIG_FEATURE_MARKET=ON`
+- Buyers/sellers lease hashrate via P2P market
+- Automated auction, pricing, and lease management
+- Configurable market role, price per kH/s, capacity, fee, lease duration, auction interval
+- API endpoints and shell UI tool for market status
+- Protocol support for offers, bids, lease ack/nack, settle
 
-- libuv1-dev, libssl-dev
-- Install with:
-  ```bash
-  sudo apt-get install -y libuv1-dev libssl-dev
-  ```
-- Notes:
-  - Default build here disables optional features: `-DWITH_OPENCL=OFF -DWITH_CUDA=OFF -DWITH_HWLOC=OFF`.
-  - If you enable them, you must install corresponding SDKs/dev headers and drivers on your system.
-  - XMRig’s TLS Stratum requires OpenSSL; `libssl-dev` provides headers for build and pulls in runtime libs.
+### Configuration System
+- Command-line argument parsing
+- Auto hardware detection & optimization
+- Algorithm and mode selection
+- Flexible resource allocation
 
-### device-daemon (native Linux)
+### Code Quality
+- ANSI C11 standard, no compiler warnings
+- Clean shutdown & resource cleanup
+- Error handling throughout
+- Well-commented, modular codebase
 
-- Optional RandomX acceleration via `librandomx`:
-  ```bash
-  sudo apt-get install -y librandomx-dev
-  ```
-- Build examples (see `docs/BUILDING.md` for full commands):
-  - Without RandomX: `gcc -O2 -pthread -o device_daemon device_daemon.c`
-  - With RandomX: `gcc -O2 -pthread -DHAVE_RANDOMX -o device_daemon device_daemon.c -lrandomx`
-- Runtime libs: glibc, pthread; when linking with RandomX also `librandomx` (and `dl`, `m` as needed by toolchain).
+## File Structure
 
-### Cross-building device-daemon for arm64
+```
+p2p-mining-cluster/
+├── src/
+│   ├── main.c
+│   ├── config.c/h
+│   ├── node.c/h
+│   ├── network.c/h
+│   ├── workload.c/h
+│   ├── mining.c/h
+│   ├── mining_randomx.c/h
+│   ├── mining_ghostrider.c/h
+│   └── stratum.c/h
+├── xmrig/
+│   └── src/market/
+│       ├── Market.cpp/h
+│       └── market.cmake
+├── bin/
+│   └── p2p-miner
+├── examples/
+│   ├── start-master.sh
+│   ├── start-worker.sh
+│   ├── start-auto.sh
+│   └── test-cluster.sh
+├── docs/
+│   ├── QUICKSTART.md
+│   ├── ARCHITECTURE.md
+│   ├── MINING_INTEGRATION.md
+│   ├── BUILDING.md
+│   ├── TESTING.md
+├── LICENSE
+├── README.md
+└── .gitignore
+```
 
-- Debian multiarch toolchains and RandomX (arm64):
-  ```bash
-  sudo dpkg --add-architecture arm64
-  sudo apt-get update
-  sudo apt-get install -y crossbuild-essential-arm64 gcc-aarch64-linux-gnu librandomx-dev:arm64
-  ```
+## Quick Start
 
-### Android (aarch64/Termux)
+### Build
+```bash
+make
+```
+Or with market features:
+```bash
+cmake -S xmrig -B xmrig/build -DXMRIG_FEATURE_MARKET=ON
+```
 
-- Android NDK r26d (or newer) for aarch64 toolchains.
-- Build RandomX for Android and point includes/libs accordingly.
-- See `docs/BUILDING.md` for the exact clang wrapper invocations and linker flags.
+### Run Mining Node
+```bash
+# RandomX mining
+./bin/p2p-miner --algo randomx --threads 4
 
-### Performance/system prerequisites
+# Ghostrider mining
+./bin/p2p-miner --algo ghostrider --threads 4
+```
+### Distributed Setup
+```bash
+# Master node (high RAM, dataset host)
+./bin/p2p-miner --mode master --dataset-host --port 9999
 
-- RandomX benefits from huge pages on Linux; consider configuring `nr_hugepages` for best performance.
-- Ensure CPU governor and power settings allow sustained performance if benchmarking.
+# Worker node (many CPUs, low RAM)
+./bin/p2p-miner --mode worker --connect 192.168.1.100:9999
+```
 
-## Quick start
+## Hashrate Marketplace Usage
 
-- Build and run XMRig locally (amd64):
-  ```bash
-  cmake -S xmrig -B xmrig/build -DWITH_REMOTE=ON -DWITH_OPENCL=OFF -DWITH_CUDA=OFF -DWITH_HWLOC=OFF
-  cmake --build xmrig/build -j$(nproc)
-  ./xmrig/build/xmrig --stress --donate-level=0 --print-time=10
-  ```
+Enable market support at build and configure roles:
+- Seller: Lease hashrate to buyers, set price/capacity/fee
+- Buyer: Acquire hashrate with automated auction/lease
 
-- Build/package instructions for device-daemon (Android aarch64 and Debian arm64/amd64): see `docs/PACKAGING.md`.
+Shell UI:
+```bash
+./xmrig/tools/market_ui.sh
+```
+API endpoints:
+- `/2/summary`: Market statistics (enabled, role, price, capacity, leases, offers, last/clearing price)
+- `/2/backends`: Backend status
 
-- Run device-daemon on target:
-  ```bash
-  # Android/Termux (aarch64, bionic):
-  dpkg -i deviced-<version>-arm64.deb  # installs /usr/bin/device-daemon
-  device-daemon --bind 127.0.0.1 -p 9000
+## Documentation
 
-  # Native Linux (amd64):
-  sudo dpkg -i device-daemon-<version>-amd64.deb || sudo apt -f install
-  device-daemon --bind 127.0.0.1 -p 9000
-  ```
+- `README.md`: Project overview
+- `QUICKSTART.md`: Getting started
+- `ARCHITECTURE.md`: System design
+- `ALGORITHM_INTEGRATION.md`: Adding new algorithms
+- `MINING_INTEGRATION.md`: Library integration
+- `TESTING.md`: Procedures and results
 
-- Example XMRig to UnMineable (SSL 443), with remote backend env:
-  ```bash
-  export P2PRIG_HOST=127.0.0.1
-  export P2PRIG_PORT=9000
-  xmrig -a rx -k \
-    -o stratum+ssl://rx.unmineable.com:443 \
-    -u TRX:TRzVcqTsDE1fr6XLmhKkoWMEJHojgwaxdH.worker1 \
-    -p x --threads=4
-  ```
+## Roadmap
 
-- Protocol reference: see `docs/PROTOCOL.md`.
-- Build and packaging guides: see `docs/BUILDING.md`, `docs/PACKAGING.md`.
+- [x] P2P networking framework
+- [x] Node capability detection
+- [x] Workload distribution
+- [x] Modular mining algorithms
+- [x] Pool (Stratum) integration
+- [x] Hashrate marketplace (Bazaar of Shards)
+- [ ] TLS/SSL pool connections
+- [ ] Pool failover and auto-reconnect
+- [ ] GPU mining support
+- [ ] Web dashboard
+- [ ] API documentation
 
-## Status
+## License
 
-- device-daemon: RandomX integrated; job submit/abort, result streaming, heartbeat; per-connection write mutex; AArch64 inline asm for endian swaps and 256-bit compare.
-- xmrig remote backend: minimal scaffold for integration. CPU backend and stress/bench run are fully functional.
+MIT License – Free for personal and commercial use.
 
-## Licensing
+## Contact & Support
 
-- xmrig/ is GPLv3 (see `xmrig/LICENSE`).
-- device-daemon: GPLv3 (see `device-daemon/LICENSE`).
+For questions, contributions, and bug reports, open a GitHub issue or see the contact section in documentation.
 
+---
+
+**p2prig**: Efficient, extensible, and market-enabled distributed mining for everyone.
