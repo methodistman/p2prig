@@ -24,7 +24,8 @@ For Android (aarch64/Termux) cross-builds, install Android NDK r26d or newer and
 ```bash
 cmake -S xmrig -B xmrig/build \
   -DWITH_REMOTE=ON \
-  -DWITH_OPENCL=OFF -DWITH_CUDA=OFF -DWITH_HWLOC=OFF
+  -DWITH_OPENCL=OFF -DWITH_CUDA=OFF -DWITH_HWLOC=OFF \
+  -DXMRIG_FEATURE_MARKET=ON
 cmake --build xmrig/build -j$(nproc)
 ```
 
@@ -90,7 +91,23 @@ Notes:
 - On Android/Termux huge pages and JIT may be unavailable. The daemon falls back to interpreter mode for correctness.
 - The Android binary is dynamically linked against bionic; deploy via Termux and run directly.
 
-## Performance considerations
+### Bazaar of Shards (Market Feature)
+
+To enable the Bazaar of Shards P2P hashrate market, build with `-DXMRIG_FEATURE_MARKET=ON`. This adds support for:
+
+- Market roles (buyer/seller) configuration
+- Automated hashrate leasing between peers
+- Market-based pricing and capacity management
+
+Example build with market support:
+```bash
+cmake -S xmrig -B xmrig/build \
+  -DWITH_REMOTE=ON \
+  -DXMRIG_FEATURE_MARKET=ON \
+  -DWITH_OPENCL=OFF -DWITH_CUDA=OFF -DWITH_HWLOC=OFF
+```
+
+### Performance considerations
 
 - Huge pages for RandomX greatly improve performance. Example (allocate ~2.3 GB):
   ```bash
