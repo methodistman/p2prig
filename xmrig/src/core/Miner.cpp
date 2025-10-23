@@ -478,6 +478,11 @@ const std::vector<xmrig::IBackend *> &xmrig::Miner::backends() const
     return d_ptr->backends;
 }
 
+xmrig::Controller *xmrig::Miner::controller() const
+{
+    return d_ptr->controller;
+}
+
 
 xmrig::Job xmrig::Miner::job() const
 {
@@ -742,6 +747,26 @@ void xmrig::Miner::onRequest(IApiRequest &request)
             }
             peer.AddMember("connections", conns, allocator);
             request.reply().AddMember("peer_server", peer, allocator);
+#endif
+#ifdef XMRIG_FEATURE_MARKET
+            {
+                using namespace rapidjson;
+                auto &allocator2 = request.doc().GetAllocator();
+                Value market(kObjectType);
+                market.AddMember("enabled", d_ptr->controller->config()->marketEnabled(), allocator2);
+                market.AddMember("role", StringRef(d_ptr->controller->config()->marketRole()), allocator2);
+                market.AddMember("price_per_khash", d_ptr->controller->config()->marketPricePerKhash(), allocator2);
+                market.AddMember("capacity_khash", d_ptr->controller->config()->marketCapacityKhash(), allocator2);
+                market.AddMember("lease_ms", d_ptr->controller->config()->marketLeaseMs(), allocator2);
+                market.AddMember("fee_bps", d_ptr->controller->config()->marketFeeBps(), allocator2);
+                market.AddMember("auction_interval_ms", d_ptr->controller->config()->marketAuctionIntervalMs(), allocator2);
+                // MVP placeholders
+                market.AddMember("offers", 0, allocator2);
+                market.AddMember("leases_active", 0, allocator2);
+                market.AddMember("last_price", 0, allocator2);
+                market.AddMember("clearing_price", 0, allocator2);
+                request.reply().AddMember("market", market, allocator2);
+            }
 #endif
         }
         else if (request.url() == "/2/backends") {

@@ -87,6 +87,14 @@ public:
         uint32_t caps{0};
         bool lease{false};
         uint64_t nextSliceId{1};
+        #ifdef XMRIG_FEATURE_MARKET
+        bool marketLeased{false};
+        uint64_t leaseId{0};
+        uint64_t leaseEndMs{0};
+        uint32_t leasePrice{0};
+        uint32_t leaseCapacity{0};
+        uint16_t leaseFeeBps{0};
+        #endif
         // meta
         int deviceCpuCount{-1};
         uint32_t deviceMaxBatch{0};
@@ -190,15 +198,31 @@ void RemoteBackend::setJob(const Job &job) {
             uint64_t start; { std::lock_guard<std::mutex> lk(d->allocMtx); start = d->globalNonceNext; d->globalNonceNext += r->effectiveBatch; }
             r->nextNonce = start;
             r->jobId = d->nextJobId.fetch_add(1);
+
             const bool rx = (job.algorithm().family() == Algorithm::RANDOM_X);
             const uint8_t *blob = job.blob(); size_t blen = job.size();
             const uint32_t off = static_cast<uint32_t>(job.nonceOffset());
             const uint8_t nsize = static_cast<uint8_t>(job.nonceSize());
             if (r->lease) {
+#ifdef XMRIG_FEATURE_MARKET
+                if (d->controller && d->controller->config()->marketEnabled()) {
+                    const char *role = d->controller->config()->marketRole();
+                    const bool isBuyer = !(role && std::strcmp(role, "seller") == 0);
+                    if (isBuyer) {
+                        uint64_t nowMsChk = static_cast<uint64_t>(
+                            std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::steady_clock::now().time_since_epoch()).count());
+                        if (!r->marketLeased || (r->leaseEndMs > 0 && nowMsChk >= r->leaseEndMs)) {
+                            r->marketLeased = false;
+                            continue;
+                        }
+                    }
+                }
+#endif
                 uint64_t sliceId = r->nextSliceId++;
                 std::vector<uint8_t> pl; pl.reserve(2+1+8+8+1+1+4+4 + blen + 8 + 4 + 32 + 8 + (rx?32+4:0));
                 pl.push_back('X'); pl.push_back('L'); pl.push_back(1);
-                uint8_t sid8[8]; uint64_t sid = sliceId; for (int i=7;i>=0;--i){ sid8[i]=static_cast<uint8_t>(sid & 0xFF); sid >>=8; }
+                uint8_t sid8[8]; for (int i=7;i>=0;--i){ sid8[i]=static_cast<uint8_t>(sliceId & 0xFF); sliceId >>=8; }
                 pl.insert(pl.end(), sid8, sid8+8);
                 uint64_t jidbe = r->jobId; uint8_t j8[8]; for (int i=7;i>=0;--i){ j8[i]=static_cast<uint8_t>(jidbe & 0xFF); jidbe >>=8; }
                 pl.insert(pl.end(), j8, j8+8);
@@ -423,8 +447,28 @@ void RemoteBackend::start(IWorker *, bool) {
                             uint64_t t64 = saved.target(); uint8_t t8[8]; for (int i=7;i>=0;--i){ t8[i]=static_cast<uint8_t>(t64&0xFF); t64>>=8; }
                             pl.insert(pl.end(), t8, t8+8);
                             if (rx) { const auto &seed = saved.seed(); pl.insert(pl.end(), seed.data(), seed.data()+32); uint32_t hbe = htonl(static_cast<uint32_t>(saved.height())); pl.insert(pl.end(), (uint8_t*)&hbe, (uint8_t*)&hbe+4); }
+#ifdef XMRIG_FEATURE_MARKET
+                            bool allowLeaseSend = true;
+                            if (d->controller && d->controller->config()->marketEnabled()) {
+                                const char *role = d->controller->config()->marketRole();
+                                const bool isBuyer = !(role && std::strcmp(role, "seller") == 0);
+                                if (isBuyer) {
+                                    uint64_t nowMsChk = static_cast<uint64_t>(
+                                        std::chrono::duration_cast<std::chrono::milliseconds>(
+                                            std::chrono::steady_clock::now().time_since_epoch()).count());
+                                    if (!r->marketLeased || (r->leaseEndMs > 0 && nowMsChk >= r->leaseEndMs)) {
+                                        r->marketLeased = false;
+                                        allowLeaseSend = false;
+                                    }
+                                }
+                            }
+                            if (allowLeaseSend) {
+#endif
                             std::lock_guard<std::mutex> lk(r->sendMtx);
                             send_frame(r->sock, 0x40 /*SLICE_LEASE_REQ*/, pl.data(), pl.size());
+#ifdef XMRIG_FEATURE_MARKET
+                            }
+#endif
                         } else {
                             std::vector<uint8_t> pl; pl.reserve(2+1+8+1+4+4 + blen + 8 + 4 + 32 + 8 + (rx?32+4:0));
                             pl.push_back('X'); pl.push_back('J'); pl.push_back(1);
@@ -498,6 +542,21 @@ void RemoteBackend::start(IWorker *, bool) {
                                     const uint8_t *blob = job.blob(); size_t blen = job.size();
                                     const uint32_t off = static_cast<uint32_t>(job.nonceOffset());
                                     const uint8_t nsize = static_cast<uint8_t>(job.nonceSize());
+#ifdef XMRIG_FEATURE_MARKET
+                                    if (d->controller && d->controller->config()->marketEnabled()) {
+                                        const char *role = d->controller->config()->marketRole();
+                                        const bool isBuyer = !(role && std::strcmp(role, "seller") == 0);
+                                        if (isBuyer) {
+                                            uint64_t nowChk = static_cast<uint64_t>(
+                                                std::chrono::duration_cast<std::chrono::milliseconds>(
+                                                    std::chrono::steady_clock::now().time_since_epoch()).count());
+                                            if (!r->marketLeased || (r->leaseEndMs > 0 && nowChk >= r->leaseEndMs)) {
+                                                r->marketLeased = false;
+                                                continue;
+                                            }
+                                        }
+                                    }
+#endif
                                     std::vector<uint8_t> pl2; pl2.reserve(2+1+8+8+1+1+4+4 + blen + 8 + 4 + 32 + 8 + (rx?32+4:0));
                                     pl2.push_back('X'); pl2.push_back('L'); pl2.push_back(1);
                                     uint64_t sliceId2 = r->nextSliceId++; uint8_t sidb[8]; for (int i=7;i>=0;--i){ sidb[i]=static_cast<uint8_t>(sliceId2 & 0xFF); sliceId2 >>=8; }
@@ -1019,6 +1078,21 @@ rapidjson::Value RemoteBackend::toJSON(rapidjson::Document &doc) const {
     uint64_t pingAge = (lastPing > 0 && nowMs > lastPing) ? (nowMs - lastPing) : 0;
     out.AddMember("last_ping_ms_ago", pingAge, allocator);
 
+#ifdef XMRIG_FEATURE_MARKET
+    {
+        // Global market view for remote backend
+        rapidjson::Value market(rapidjson::kObjectType);
+        auto cfg = d->controller->config();
+        market.AddMember("enabled", cfg->marketEnabled(), allocator);
+        market.AddMember("role", rapidjson::Value().SetString(cfg->marketRole(), static_cast<rapidjson::SizeType>(std::strlen(cfg->marketRole())), allocator), allocator);
+        market.AddMember("max_price_per_khash", cfg->marketPricePerKhash(), allocator);
+        market.AddMember("lease_ms", cfg->marketLeaseMs(), allocator);
+        market.AddMember("connected_offers", 0, allocator);
+        market.AddMember("chosen", rapidjson::Value(rapidjson::kNullType), allocator);
+        out.AddMember("market", market, allocator);
+    }
+#endif
+
     // Multi-remote detailed view
     if (!d->remotes.empty()) {
         rapidjson::Value arr(rapidjson::kArrayType);
@@ -1040,6 +1114,15 @@ rapidjson::Value RemoteBackend::toJSON(rapidjson::Document &doc) const {
             uint64_t lpg = r->lastPingMs.load();
             uint64_t page = (lpg > 0 && nowMs > lpg) ? (nowMs - lpg) : 0;
             ro.AddMember("last_ping_ms_ago", page, allocator);
+#ifdef XMRIG_FEATURE_MARKET
+            {
+                rapidjson::Value rmk(rapidjson::kObjectType);
+                rmk.AddMember("lease_supported", r->lease, allocator);
+                rmk.AddMember("connected_offers", 0, allocator);
+                rmk.AddMember("chosen", rapidjson::Value(rapidjson::kNullType), allocator);
+                ro.AddMember("market", rmk, allocator);
+            }
+#endif
             arr.PushBack(ro, allocator);
         }
         out.AddMember("remotes", arr, allocator);

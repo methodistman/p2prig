@@ -52,6 +52,17 @@ public:
     static const char *kPeerPort;         // "port"
     static const char *kPeerToken;        // "token"
 
+#   ifdef XMRIG_FEATURE_MARKET
+    static const char *kMarket;           // "market"
+    static const char *kMarketEnabled;    // "enabled"
+    static const char *kMarketRole;       // "role"
+    static const char *kMarketPricePerKhash;      // "price_per_khash"
+    static const char *kMarketCapacityKhash;      // "capacity_khash"
+    static const char *kMarketLeaseMs;            // "lease_ms"
+    static const char *kMarketFeeBps;             // "fee_bps"
+    static const char *kMarketAuctionIntervalMs;  // "auction_interval_ms"
+#   endif
+
 #   ifdef XMRIG_FEATURE_OPENCL
     static const char *kOcl;
 #   endif
@@ -82,6 +93,16 @@ public:
     const char *peerBind() const; // default "127.0.0.1"
     uint16_t peerPort() const;    // default 9000
     const char *peerToken() const;
+
+#   ifdef XMRIG_FEATURE_MARKET
+    bool marketEnabled() const;
+    const char *marketRole() const; // "auto"|"buyer"|"seller"
+    uint32_t marketPricePerKhash() const; // in arbitrary units
+    uint32_t marketCapacityKhash() const; // seller capacity
+    uint32_t marketLeaseMs() const;       // lease window
+    uint16_t marketFeeBps() const;        // seller fee
+    uint32_t marketAuctionIntervalMs() const;
+#   endif
 
 #   ifdef XMRIG_FEATURE_OPENCL
     const OclConfig &cl() const;

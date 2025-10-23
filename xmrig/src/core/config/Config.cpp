@@ -59,6 +59,16 @@ const char *Config::kPeerEnabled        = "enabled";
 const char *Config::kPeerBind           = "bind";
 const char *Config::kPeerPort           = "port";
 const char *Config::kPeerToken          = "token";
+#ifdef XMRIG_FEATURE_MARKET
+const char *Config::kMarket                     = "market";
+const char *Config::kMarketEnabled              = "enabled";
+const char *Config::kMarketRole                 = "role";
+const char *Config::kMarketPricePerKhash        = "price_per_khash";
+const char *Config::kMarketCapacityKhash        = "capacity_khash";
+const char *Config::kMarketLeaseMs              = "lease_ms";
+const char *Config::kMarketFeeBps               = "fee_bps";
+const char *Config::kMarketAuctionIntervalMs    = "auction_interval_ms";
+#endif
 
 
 #ifdef XMRIG_FEATURE_OPENCL
@@ -90,6 +100,15 @@ public:
     String peerBind = String("127.0.0.1");
     uint16_t peerPort = 9000;
     String peerToken;
+#   ifdef XMRIG_FEATURE_MARKET
+    bool marketEnabled = false;
+    String marketRole = String("auto");
+    uint32_t marketPricePerKhash = 0;
+    uint32_t marketCapacityKhash = 0;
+    uint32_t marketLeaseMs = 2000;
+    uint16_t marketFeeBps = 0;
+    uint32_t marketAuctionIntervalMs = 2000;
+#   endif
 
 #   ifdef XMRIG_ALGO_RANDOMX
     RxConfig rx;
@@ -177,6 +196,15 @@ const char *xmrig::Config::peerToken() const
 {
     return d_ptr->peerToken.isNull() ? nullptr : d_ptr->peerToken.data();
 }
+#ifdef XMRIG_FEATURE_MARKET
+bool xmrig::Config::marketEnabled() const { return d_ptr->marketEnabled; }
+const char *xmrig::Config::marketRole() const { return d_ptr->marketRole.isNull() ? "auto" : d_ptr->marketRole.data(); }
+uint32_t xmrig::Config::marketPricePerKhash() const { return d_ptr->marketPricePerKhash; }
+uint32_t xmrig::Config::marketCapacityKhash() const { return d_ptr->marketCapacityKhash; }
+uint32_t xmrig::Config::marketLeaseMs() const { return d_ptr->marketLeaseMs; }
+uint16_t xmrig::Config::marketFeeBps() const { return d_ptr->marketFeeBps; }
+uint32_t xmrig::Config::marketAuctionIntervalMs() const { return d_ptr->marketAuctionIntervalMs; }
+#endif
 
 
 #ifdef XMRIG_FEATURE_OPENCL
@@ -294,6 +322,32 @@ bool xmrig::Config::read(const IJsonReader &reader, const char *fileName)
             d_ptr->peerToken = String(peer[kPeerToken]);
         }
     }
+#   ifdef XMRIG_FEATURE_MARKET
+    const auto &market = reader.getValue(kMarket);
+    if (market.IsObject()) {
+        if (market.HasMember(kMarketEnabled) && market[kMarketEnabled].IsBool()) {
+            d_ptr->marketEnabled = market[kMarketEnabled].GetBool();
+        }
+        if (market.HasMember(kMarketRole) && market[kMarketRole].IsString()) {
+            d_ptr->marketRole = String(market[kMarketRole]);
+        }
+        if (market.HasMember(kMarketPricePerKhash) && market[kMarketPricePerKhash].IsUint()) {
+            d_ptr->marketPricePerKhash = market[kMarketPricePerKhash].GetUint();
+        }
+        if (market.HasMember(kMarketCapacityKhash) && market[kMarketCapacityKhash].IsUint()) {
+            d_ptr->marketCapacityKhash = market[kMarketCapacityKhash].GetUint();
+        }
+        if (market.HasMember(kMarketLeaseMs) && market[kMarketLeaseMs].IsUint()) {
+            d_ptr->marketLeaseMs = market[kMarketLeaseMs].GetUint();
+        }
+        if (market.HasMember(kMarketFeeBps) && market[kMarketFeeBps].IsUint()) {
+            d_ptr->marketFeeBps = static_cast<uint16_t>(market[kMarketFeeBps].GetUint());
+        }
+        if (market.HasMember(kMarketAuctionIntervalMs) && market[kMarketAuctionIntervalMs].IsUint()) {
+            d_ptr->marketAuctionIntervalMs = market[kMarketAuctionIntervalMs].GetUint();
+        }
+    }
+#   endif
 
     return true;
 }
@@ -368,5 +422,16 @@ void xmrig::Config::getJSON(rapidjson::Document &doc) const
             peer.AddMember(StringRef(kPeerToken), StringRef(peerToken()), allocator);
         }
         doc.AddMember(StringRef(kPeer), peer, allocator);
+#   ifdef XMRIG_FEATURE_MARKET
+        Value market(kObjectType);
+        market.AddMember(StringRef(kMarketEnabled), Value(marketEnabled()), allocator);
+        market.AddMember(StringRef(kMarketRole), StringRef(marketRole()), allocator);
+        market.AddMember(StringRef(kMarketPricePerKhash), Value(marketPricePerKhash()), allocator);
+        market.AddMember(StringRef(kMarketCapacityKhash), Value(marketCapacityKhash()), allocator);
+        market.AddMember(StringRef(kMarketLeaseMs), Value(marketLeaseMs()), allocator);
+        market.AddMember(StringRef(kMarketFeeBps), Value(marketFeeBps()), allocator);
+        market.AddMember(StringRef(kMarketAuctionIntervalMs), Value(marketAuctionIntervalMs()), allocator);
+        doc.AddMember(StringRef(kMarket), market, allocator);
+#   endif
     }
 }

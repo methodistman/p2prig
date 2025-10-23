@@ -22,6 +22,7 @@ private:
     static void onClosed(uv_handle_t* h);
     static void onWrite(uv_write_t* req, int status);
     static void onTimeout(uv_timer_t* t);
+    static void onOfferTimer(uv_timer_t* t);
     static void onWork(uv_work_t* req);
     static void onWorkAfter(uv_work_t* req, int status);
 
@@ -30,6 +31,7 @@ private:
     bool processFrame(uint8_t opcode, const uint8_t* payload, size_t len);
     bool sendFrame(uint8_t opcode, const uint8_t* payload, size_t len);
     void close();
+    void sendMarketOffer();
 
     struct XJTask {
         uint64_t jobId = 0;
@@ -60,6 +62,7 @@ private:
     bool helloDone_ = false;
     struct uv_tcp_s* client_ = nullptr;
     uv_timer_t* timer_ = nullptr;
+    uv_timer_t* offerTimer_ = nullptr;
     std::atomic<bool> busy_{false};
     std::atomic<bool> cancel_{false};
     uv_work_t* work_ = nullptr;
@@ -67,6 +70,20 @@ private:
     struct XJResult { uint64_t nonce; uint8_t hash[32]; };
     std::vector<XJResult> xjResults_;
     uint64_t workDurMs_ = 0;
+
+    // Market (MVP) - single active lease per session
+    uint64_t lastLeaseId_ = 0;
+    uint64_t leaseEndMs_ = 0;
+    uint32_t pricePerKhash_ = 0;
+    uint32_t capacityKhash_ = 0;
+    uint32_t ackPricePerKhash_ = 0;
+    uint32_t ackCapacityKhash_ = 0;
+    uint32_t leaseMsCfg_ = 0;
+    uint16_t feeBps_ = 0;
+    bool leaseActive_ = false;
+    uint64_t usedKhashAccum_ = 0;
+    uint64_t msAccum_ = 0;
+    uint32_t resultsAccum_ = 0;
 };
 
 } // namespace xmrig::peer

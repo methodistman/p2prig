@@ -34,6 +34,7 @@ option(WITH_SECURE_JIT      "Enable secure access to JIT memory" OFF)
 option(WITH_DMI             "Enable DMI/SMBIOS reader" ON)
 option(WITH_REMOTE          "Enable remote backend (experimental)" OFF)
 option(WITH_PEER            "Enable embedded peer server (experimental)" ON)
+option(WITH_MARKET          "Enable market (Bazaar of Shards) experimental" OFF)
 
 option(BUILD_STATIC         "Build static binary" OFF)
 option(ARM_V8               "Force ARMv8 (64 bit) architecture, use with caution if automatic detection fails, but you sure it may work" OFF)
@@ -50,6 +51,7 @@ include (cmake/os.cmake)
 include (src/base/base.cmake)
 include (src/backend/backend.cmake)
 include (src/peer/peer.cmake)
+include (src/market/market.cmake)
 
 
 set(HEADERS
@@ -57,6 +59,7 @@ set(HEADERS
     "${HEADERS_BASE_HTTP}"
     "${HEADERS_BACKEND}"
     "${HEADERS_PEER}"
+    "${HEADERS_MARKET}"
     src/App.h
     src/core/config/Config_default.h
     src/core/config/Config_platform.h
@@ -110,6 +113,7 @@ set(SOURCES
     "${SOURCES_BASE_HTTP}"
     "${SOURCES_BACKEND}"
     "${SOURCES_PEER}"
+    "${SOURCES_MARKET}"
     src/App.cpp
     src/core/config/Config.cpp
     src/core/config/ConfigTransform.cpp
@@ -239,6 +243,10 @@ include_directories(${UV_INCLUDE_DIR})
 
 if (WITH_DEBUG_LOG)
     add_definitions(/DAPP_DEBUG)
+endif()
+
+if (WITH_MARKET)
+    add_definitions(/DXMRIG_FEATURE_MARKET)
 endif()
 
 add_executable(${CMAKE_PROJECT_NAME} ${HEADERS} ${SOURCES} ${SOURCES_OS} ${HEADERS_CRYPTO} ${SOURCES_CRYPTO} ${SOURCES_SYSLOG} ${TLS_SOURCES} ${XMRIG_ASM_SOURCES})

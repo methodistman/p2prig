@@ -1,0 +1,8 @@
+Package: device-daemon
+Version: 0.1.1+android1
+Architecture: arm64
+Maintainer: Gregory <gregory@example.com>
+Priority: optional
+Section: utils
+Description: Remote mining device daemon (Android aarch64 build)
+ Minimal device-side RPC daemon for RandomX jobs. Built for Android (bionic libc).

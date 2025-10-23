@@ -59,6 +59,9 @@ public:
     void setJob(const Job &job, bool donate);
     void stop();
 
+    // Access to controller for modules that need configuration
+    class Controller *controller() const;
+
 protected:
     void onConfigChanged(Config *config, Config *previousConfig) override;
     void onTimer(const Timer *timer) override;

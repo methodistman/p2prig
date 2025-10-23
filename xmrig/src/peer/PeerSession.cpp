@@ -14,6 +14,9 @@
 #include <cstdlib>
 #include <chrono>
 
+#include "core/Controller.h"
+#include "core/config/Config.h"
+
 namespace xmrig::peer {
 
 namespace {
@@ -27,6 +30,18 @@ static inline uint64_t be_to_u64(const uint8_t* p) {
 
 static inline uint32_t be_to_u32(const uint8_t* p) {
     return (static_cast<uint32_t>(p[0]) << 24) | (static_cast<uint32_t>(p[1]) << 16) | (static_cast<uint32_t>(p[2]) << 8) | static_cast<uint32_t>(p[3]);
+}
+
+static inline void be_write_u32(uint8_t* out, uint32_t v) {
+    out[0] = static_cast<uint8_t>((v >> 24) & 0xFF);
+    out[1] = static_cast<uint8_t>((v >> 16) & 0xFF);
+    out[2] = static_cast<uint8_t>((v >> 8) & 0xFF);
+    out[3] = static_cast<uint8_t>(v & 0xFF);
+}
+
+static inline void be_write_u16(uint8_t* out, uint16_t v) {
+    out[0] = static_cast<uint8_t>((v >> 8) & 0xFF);
+    out[1] = static_cast<uint8_t>(v & 0xFF);
 }
 
 static inline void write_nonce_le(uint8_t* dst, uint64_t nonce, uint8_t nsize) {
@@ -158,6 +173,30 @@ bool PeerSession::processFrame(uint8_t opcode, const uint8_t* payload, size_t le
 
         helloDone_ = true;
         if (timer_) { uv_timer_stop(timer_); }
+        // Start market offer timer if enabled and acting as seller
+#ifdef XMRIG_FEATURE_MARKET
+        if (miner_ && miner_->controller() && miner_->controller()->config()->marketEnabled()) {
+            const char* role = miner_->controller()->config()->marketRole();
+            if (!(role && std::strcmp(role, "buyer") == 0)) {
+                leaseMsCfg_   = miner_->controller()->config()->marketLeaseMs();
+                pricePerKhash_ = miner_->controller()->config()->marketPricePerKhash();
+                capacityKhash_ = miner_->controller()->config()->marketCapacityKhash();
+                feeBps_        = miner_->controller()->config()->marketFeeBps();
+                if (!offerTimer_) {
+                    offerTimer_ = new (std::nothrow) uv_timer_t;
+                    if (offerTimer_) {
+                        uv_timer_init(uv_default_loop(), offerTimer_);
+                        offerTimer_->data = this;
+                        uint64_t interval = miner_->controller()->config()->marketAuctionIntervalMs();
+                        if (interval == 0) interval = 2000;
+                        uv_timer_start(offerTimer_, PeerSession::onOfferTimer, interval, interval);
+                    }
+                }
+            }
+        }
+#endif
+
+ 
         return true;
     }
 
@@ -204,6 +243,62 @@ bool PeerSession::processFrame(uint8_t opcode, const uint8_t* payload, size_t le
         }
         return startXJ(t);
     }
+
+#ifdef XMRIG_FEATURE_MARKET
+    // MARKET_BID (0x72): ver(1), desired_cap_khash(4), max_price_per_khash(4), lease_ms(4)
+    if (opcode == 0x72) {
+        if (!miner_ || !miner_->controller() || !miner_->controller()->config()->marketEnabled()) {
+            return true;
+        }
+        if (!payload || len < 1 + 4 + 4 + 4) {
+            return false;
+        }
+        size_t pos = 0; (void)payload[pos++];
+        const uint32_t desiredCap = be_to_u32(payload + pos); pos += 4;
+        const uint32_t maxPrice   = be_to_u32(payload + pos); pos += 4;
+        const uint32_t reqLeaseMs = be_to_u32(payload + pos); pos += 4;
+        const uint32_t ask = pricePerKhash_ ? pricePerKhash_ : miner_->controller()->config()->marketPricePerKhash();
+        const uint32_t cap = capacityKhash_ ? capacityKhash_ : miner_->controller()->config()->marketCapacityKhash();
+        const uint32_t confLease = leaseMsCfg_ ? leaseMsCfg_ : miner_->controller()->config()->marketLeaseMs();
+        const uint32_t leaseMs = reqLeaseMs > 0 ? (reqLeaseMs < confLease ? reqLeaseMs : confLease) : confLease;
+        const uint32_t grantCap = (desiredCap < cap ? desiredCap : cap);
+        if (leaseActive_ || grantCap == 0 || leaseMs == 0 || maxPrice < ask) {
+            uint8_t nack[4]; be_write_u16(nack, 1); be_write_u16(nack + 2, 0);
+            sendFrame(0x74 /*MARKET_LEASE_NACK*/, nack, sizeof(nack));
+            return true;
+        }
+        // Accept bid and start lease window
+        lastLeaseId_ = lastLeaseId_ ? (lastLeaseId_ + 1) : 1;
+        ackPricePerKhash_ = ask;
+        ackCapacityKhash_ = grantCap;
+        usedKhashAccum_ = 0; msAccum_ = 0; resultsAccum_ = 0;
+        const uint64_t nowMs = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                 std::chrono::steady_clock::now().time_since_epoch()).count());
+        leaseEndMs_ = nowMs + static_cast<uint64_t>(leaseMs);
+        leaseActive_ = true;
+        // ack payload: lease_id(8) price(4) cap(4) lease_ms(4) fee_bps(2)
+        uint8_t ack[8 + 4 + 4 + 4 + 2];
+        be_write_u64(ack, lastLeaseId_);
+        be_write_u32(ack + 8, ackPricePerKhash_);
+        be_write_u32(ack + 12, ackCapacityKhash_);
+        be_write_u32(ack + 16, leaseMs);
+        be_write_u16(ack + 20, feeBps_);
+        sendFrame(0x73 /*MARKET_LEASE_ACK*/, ack, sizeof(ack));
+        return true;
+    }
+#endif
+
+#ifdef XMRIG_FEATURE_MARKET
+    // MARKET_SETTLE_ACK (0x76): lease_id(8)
+    if (opcode == 0x76) {
+        if (!payload || len < 8) {
+            return false;
+        }
+        const uint64_t ackLease = be_to_u64(payload);
+        (void)ackLease; // For MVP we just accept and ignore mismatches
+        return true;
+    }
+#endif
 
     // PING (0x03) -> PONG (0x04)
     if (opcode == 0x03) {
@@ -275,6 +370,13 @@ void PeerSession::close()
         uv_close(reinterpret_cast<uv_handle_t*>(timer_), nullptr);
         timer_ = nullptr;
     }
+#ifdef XMRIG_FEATURE_MARKET
+    if (offerTimer_) {
+        uv_timer_stop(offerTimer_);
+        uv_close(reinterpret_cast<uv_handle_t*>(offerTimer_), nullptr);
+        offerTimer_ = nullptr;
+    }
+#endif
     uv_read_stop(reinterpret_cast<uv_stream_t*>(client_));
     uv_close(reinterpret_cast<uv_handle_t*>(client_), PeerSession::onClosed);
 }
@@ -293,6 +395,47 @@ void PeerSession::onTimeout(uv_timer_t* t)
     if (!self->helloDone_) {
         self->close();
     }
+}
+
+void PeerSession::onOfferTimer(uv_timer_t* t)
+{
+#ifdef XMRIG_FEATURE_MARKET
+    auto* self = static_cast<PeerSession*>(t->data);
+    if (!self) return;
+    if (!self->leaseActive_) {
+        self->sendMarketOffer();
+    }
+#else
+    (void)t;
+#endif
+}
+
+void PeerSession::sendMarketOffer()
+{
+#ifdef XMRIG_FEATURE_MARKET
+    // Build a simple OFFER: ver(1), price_per_khash(4), capacity_khash(4), lease_ms(4), fee_bps(2)
+    uint32_t price = pricePerKhash_;
+    uint32_t cap = capacityKhash_;
+    uint32_t leaseMs = leaseMsCfg_;
+    uint16_t fee = feeBps_;
+    if (miner_ && miner_->controller()) {
+        auto cfg = miner_->controller()->config();
+        if (price == 0) price = cfg->marketPricePerKhash();
+        if (cap == 0) cap = cfg->marketCapacityKhash();
+        if (leaseMs == 0) leaseMs = cfg->marketLeaseMs();
+        if (fee == 0) fee = cfg->marketFeeBps();
+    }
+    if (price == 0 || cap == 0 || leaseMs == 0) {
+        return;
+    }
+    uint8_t pl[1 + 4 + 4 + 4 + 2];
+    pl[0] = 1;
+    be_write_u32(pl + 1, price);
+    be_write_u32(pl + 5, cap);
+    be_write_u32(pl + 9, leaseMs);
+    be_write_u16(pl + 13, fee);
+    sendFrame(0x71 /*MARKET_OFFER*/, pl, sizeof(pl));
+#endif
 }
 
 bool PeerSession::parseXJBinary(const uint8_t* payload, size_t len, XJTask& out)
@@ -388,6 +531,31 @@ void PeerSession::onWorkAfter(uv_work_t* req, int)
         be_write_u64(done + 8, self->workDurMs_);
         self->sendFrame(0x13 /*DONE*/, done, sizeof(done));
     }
+    
+#ifdef XMRIG_FEATURE_MARKET
+    // Accumulate usage and settle if lease expired
+    if (self->leaseActive_) {
+        self->msAccum_ += self->workDurMs_;
+        self->resultsAccum_ += static_cast<uint32_t>(self->xjResults_.size());
+        // approximate consumed hashes as nonceCount; convert to kH
+        self->usedKhashAccum_ += static_cast<uint64_t>(self->xj_.nonceCount / 1000);
+        const uint64_t nowMs = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                  std::chrono::steady_clock::now().time_since_epoch()).count());
+        if (nowMs >= self->leaseEndMs_) {
+            uint8_t stl[8 + 8 + 8 + 4 + 2];
+            be_write_u64(stl, self->lastLeaseId_);
+            be_write_u64(stl + 8, self->usedKhashAccum_);
+            be_write_u64(stl + 16, self->msAccum_);
+            be_write_u32(stl + 24, self->ackPricePerKhash_);
+            be_write_u16(stl + 28, self->feeBps_);
+            self->sendFrame(0x75 /*MARKET_SETTLE*/, stl, sizeof(stl));
+            self->leaseActive_ = false;
+            self->usedKhashAccum_ = 0;
+            self->msAccum_ = 0;
+            self->resultsAccum_ = 0;
+        }
+    }
+#endif
     self->busy_.store(false);
     delete req;
     self->work_ = nullptr;

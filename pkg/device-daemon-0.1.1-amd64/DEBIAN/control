@@ -1,0 +1,9 @@
+Package: device-daemon
+Version: 0.1.1
+Architecture: amd64
+Maintainer: Gregory <gregory@example.com>
+Priority: optional
+Section: utils
+Depends: librandomx0 (>= 1.1.10), libc6 (>= 2.31)
+Description: Remote mining device daemon (amd64)
+ Minimal device-side RPC daemon for RandomX jobs.
