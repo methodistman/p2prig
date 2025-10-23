@@ -83,6 +83,10 @@ public:
         double doneEwmaMs{0.0};
         uint32_t reconnects{0};
         uint32_t consecutiveFails{0};
+        // capabilities / lease support
+        uint32_t caps{0};
+        bool lease{false};
+        uint64_t nextSliceId{1};
         // meta
         int deviceCpuCount{-1};
         uint32_t deviceMaxBatch{0};
@@ -190,23 +194,45 @@ void RemoteBackend::setJob(const Job &job) {
             const uint8_t *blob = job.blob(); size_t blen = job.size();
             const uint32_t off = static_cast<uint32_t>(job.nonceOffset());
             const uint8_t nsize = static_cast<uint8_t>(job.nonceSize());
-            std::vector<uint8_t> pl; pl.reserve(2+1+8+1+4+4 + blen + 8 + 4 + 32 + 8 + (rx?32+4:0));
-            pl.push_back('X'); pl.push_back('J'); pl.push_back(1);
-            uint64_t jidbe = r->jobId; uint8_t tmp8[8]; for (int i=7;i>=0;--i){ tmp8[i]=static_cast<uint8_t>(jidbe & 0xFF); jidbe >>=8; }
-            pl.insert(pl.end(), tmp8, tmp8+8);
-            pl.push_back(rx ? 0x01 : 0x00);
-            pl.push_back(nsize);
-            uint32_t offbe = htonl(off); pl.insert(pl.end(), (uint8_t*)&offbe, (uint8_t*)&offbe+4);
-            uint32_t blbe = htonl(static_cast<uint32_t>(blen)); pl.insert(pl.end(), (uint8_t*)&blbe, (uint8_t*)&blbe+4);
-            pl.insert(pl.end(), blob, blob + blen);
-            uint64_t ns = r->nextNonce; uint8_t ns8[8]; for (int i=7;i>=0;--i){ ns8[i]=static_cast<uint8_t>(ns&0xFF); ns>>=8; }
-            pl.insert(pl.end(), ns8, ns8+8);
-            uint32_t ncbe = htonl(r->effectiveBatch); pl.insert(pl.end(), (uint8_t*)&ncbe, (uint8_t*)&ncbe+4);
-            pl.insert(pl.end(), 32, 0);
-            uint64_t t64 = job.target(); uint8_t t8[8]; for (int i=7;i>=0;--i){ t8[i]=static_cast<uint8_t>(t64&0xFF); t64>>=8; }
-            pl.insert(pl.end(), t8, t8+8);
-            if (rx) { const auto &seed = job.seed(); pl.insert(pl.end(), seed.data(), seed.data()+32); uint32_t hbe = htonl(static_cast<uint32_t>(job.height())); pl.insert(pl.end(), (uint8_t*)&hbe, (uint8_t*)&hbe+4); }
-            {
+            if (r->lease) {
+                uint64_t sliceId = r->nextSliceId++;
+                std::vector<uint8_t> pl; pl.reserve(2+1+8+8+1+1+4+4 + blen + 8 + 4 + 32 + 8 + (rx?32+4:0));
+                pl.push_back('X'); pl.push_back('L'); pl.push_back(1);
+                uint8_t sid8[8]; uint64_t sid = sliceId; for (int i=7;i>=0;--i){ sid8[i]=static_cast<uint8_t>(sid & 0xFF); sid >>=8; }
+                pl.insert(pl.end(), sid8, sid8+8);
+                uint64_t jidbe = r->jobId; uint8_t j8[8]; for (int i=7;i>=0;--i){ j8[i]=static_cast<uint8_t>(jidbe & 0xFF); jidbe >>=8; }
+                pl.insert(pl.end(), j8, j8+8);
+                pl.push_back(rx ? 0x01 : 0x00);
+                pl.push_back(nsize);
+                uint32_t offbe = htonl(off); pl.insert(pl.end(), (uint8_t*)&offbe, (uint8_t*)&offbe+4);
+                uint32_t blbe = htonl(static_cast<uint32_t>(blen)); pl.insert(pl.end(), (uint8_t*)&blbe, (uint8_t*)&blbe+4);
+                pl.insert(pl.end(), blob, blob + blen);
+                uint64_t ns = r->nextNonce; uint8_t ns8[8]; for (int i=7;i>=0;--i){ ns8[i]=static_cast<uint8_t>(ns&0xFF); ns>>=8; }
+                pl.insert(pl.end(), ns8, ns8+8);
+                uint32_t ncbe = htonl(r->effectiveBatch); pl.insert(pl.end(), (uint8_t*)&ncbe, (uint8_t*)&ncbe+4);
+                pl.insert(pl.end(), 32, 0);
+                uint64_t t64 = job.target(); uint8_t t8[8]; for (int i=7;i>=0;--i){ t8[i]=static_cast<uint8_t>(t64&0xFF); t64>>=8; }
+                pl.insert(pl.end(), t8, t8+8);
+                if (rx) { const auto &seed = job.seed(); pl.insert(pl.end(), seed.data(), seed.data()+32); uint32_t hbe = htonl(static_cast<uint32_t>(job.height())); pl.insert(pl.end(), (uint8_t*)&hbe, (uint8_t*)&hbe+4); }
+                std::lock_guard<std::mutex> lk(r->sendMtx);
+                send_frame(r->sock, 0x40 /*SLICE_LEASE_REQ*/, pl.data(), pl.size());
+            } else {
+                std::vector<uint8_t> pl; pl.reserve(2+1+8+1+4+4 + blen + 8 + 4 + 32 + 8 + (rx?32+4:0));
+                pl.push_back('X'); pl.push_back('J'); pl.push_back(1);
+                uint64_t jidbe = r->jobId; uint8_t tmp8[8]; for (int i=7;i>=0;--i){ tmp8[i]=static_cast<uint8_t>(jidbe & 0xFF); jidbe >>=8; }
+                pl.insert(pl.end(), tmp8, tmp8+8);
+                pl.push_back(rx ? 0x01 : 0x00);
+                pl.push_back(nsize);
+                uint32_t offbe = htonl(off); pl.insert(pl.end(), (uint8_t*)&offbe, (uint8_t*)&offbe+4);
+                uint32_t blbe = htonl(static_cast<uint32_t>(blen)); pl.insert(pl.end(), (uint8_t*)&blbe, (uint8_t*)&blbe+4);
+                pl.insert(pl.end(), blob, blob + blen);
+                uint64_t ns = r->nextNonce; uint8_t ns8[8]; for (int i=7;i>=0;--i){ ns8[i]=static_cast<uint8_t>(ns&0xFF); ns>>=8; }
+                pl.insert(pl.end(), ns8, ns8+8);
+                uint32_t ncbe = htonl(r->effectiveBatch); pl.insert(pl.end(), (uint8_t*)&ncbe, (uint8_t*)&ncbe+4);
+                pl.insert(pl.end(), 32, 0);
+                uint64_t t64 = job.target(); uint8_t t8[8]; for (int i=7;i>=0;--i){ t8[i]=static_cast<uint8_t>(t64&0xFF); t64>>=8; }
+                pl.insert(pl.end(), t8, t8+8);
+                if (rx) { const auto &seed = job.seed(); pl.insert(pl.end(), seed.data(), seed.data()+32); uint32_t hbe = htonl(static_cast<uint32_t>(job.height())); pl.insert(pl.end(), (uint8_t*)&hbe, (uint8_t*)&hbe+4); }
                 std::lock_guard<std::mutex> lk(r->sendMtx);
                 send_frame(r->sock, 0x10 /*JOB_SUBMIT*/, pl.data(), pl.size());
             }
@@ -337,7 +363,12 @@ void RemoteBackend::start(IWorker *, bool) {
                     uint8_t op2 = 0; if (::read(fd2, &op2, 1) != 1) { ::close(fd2); std::this_thread::sleep_for(std::chrono::seconds(backoff)); backoff = backoff < 30 ? (backoff * 2) : 30; continue; }
                     std::vector<uint8_t> pl2; if (len2 > 1) { pl2.resize(static_cast<size_t>(len2-1)); if (::read(fd2, pl2.data(), pl2.size()) != static_cast<ssize_t>(pl2.size())) { ::close(fd2); std::this_thread::sleep_for(std::chrono::seconds(backoff)); backoff = backoff < 30 ? (backoff * 2) : 30; continue; } }
                     if (op2 != 0x31 /*SERVER_HELLO*/ || pl2.size() < 2+4+1) { ::close(fd2); std::this_thread::sleep_for(std::chrono::seconds(backoff)); backoff = backoff < 30 ? (backoff * 2) : 30; continue; }
-
+                    if (pl2.size() >= 7) {
+                        uint32_t cc = (static_cast<uint32_t>(pl2[2]) << 24) | (static_cast<uint32_t>(pl2[3]) << 16) | (static_cast<uint32_t>(pl2[4]) << 8) | (static_cast<uint32_t>(pl2[5]));
+                        r->caps = cc;
+                        r->lease = (r->caps & 0x2u) != 0;
+                    }
+                    
                     // Connected
                     r->sock = fd2; r->handshakeDone = true; backoff = 1;
                     r->lastRxMs.store(static_cast<uint64_t>(
@@ -373,23 +404,44 @@ void RemoteBackend::start(IWorker *, bool) {
                         r->effectiveBatch = eff > 0 ? eff : base;
                         uint64_t start; { std::lock_guard<std::mutex> lk(d->allocMtx); start = d->globalNonceNext; d->globalNonceNext += r->effectiveBatch; }
                         r->nextNonce = start;
-                        std::vector<uint8_t> pl; pl.reserve(2+1+8+1+4+4 + blen + 8 + 4 + 32 + 8 + (rx?32+4:0));
-                        pl.push_back('X'); pl.push_back('J'); pl.push_back(1);
-                        uint64_t jidbe = r->jobId; uint8_t tmp8[8]; for (int i=7;i>=0;--i){ tmp8[i]=static_cast<uint8_t>(jidbe & 0xFF); jidbe >>=8; }
-                        pl.insert(pl.end(), tmp8, tmp8+8);
-                        pl.push_back(rx ? 0x01 : 0x00);
-                        pl.push_back(nsize);
-                        uint32_t offbe = htonl(off); pl.insert(pl.end(), (uint8_t*)&offbe, (uint8_t*)&offbe+4);
-                        uint32_t blbe = htonl(static_cast<uint32_t>(blen)); pl.insert(pl.end(), (uint8_t*)&blbe, (uint8_t*)&blbe+4);
-                        pl.insert(pl.end(), blob, blob + blen);
-                        uint64_t ns = r->nextNonce; uint8_t ns8[8]; for (int i=7;i>=0;--i){ ns8[i]=static_cast<uint8_t>(ns&0xFF); ns>>=8; }
-                        pl.insert(pl.end(), ns8, ns8+8);
-                        uint32_t ncbe = htonl(r->effectiveBatch); pl.insert(pl.end(), (uint8_t*)&ncbe, (uint8_t*)&ncbe+4);
-                        pl.insert(pl.end(), 32, 0);
-                        uint64_t t64 = saved.target(); uint8_t t8[8]; for (int i=7;i>=0;--i){ t8[i]=static_cast<uint8_t>(t64&0xFF); t64>>=8; }
-                        pl.insert(pl.end(), t8, t8+8);
-                        if (rx) { const auto &seed = saved.seed(); pl.insert(pl.end(), seed.data(), seed.data()+32); uint32_t hbe = htonl(static_cast<uint32_t>(saved.height())); pl.insert(pl.end(), (uint8_t*)&hbe, (uint8_t*)&hbe+4); }
-                        {
+                        if (r->lease) {
+                            std::vector<uint8_t> pl; pl.reserve(2+1+8+8+1+1+4+4 + blen + 8 + 4 + 32 + 8 + (rx?32+4:0));
+                            pl.push_back('X'); pl.push_back('L'); pl.push_back(1);
+                            uint64_t sliceId = r->nextSliceId++; uint8_t sid8[8]; for (int i=7;i>=0;--i){ sid8[i]=static_cast<uint8_t>(sliceId & 0xFF); sliceId >>=8; }
+                            pl.insert(pl.end(), sid8, sid8+8);
+                            uint64_t jidbe = r->jobId; uint8_t j8[8]; for (int i=7;i>=0;--i){ j8[i]=static_cast<uint8_t>(jidbe & 0xFF); jidbe >>=8; }
+                            pl.insert(pl.end(), j8, j8+8);
+                            pl.push_back(rx ? 0x01 : 0x00);
+                            pl.push_back(nsize);
+                            uint32_t offbe = htonl(off); pl.insert(pl.end(), (uint8_t*)&offbe, (uint8_t*)&offbe+4);
+                            uint32_t blbe = htonl(static_cast<uint32_t>(blen)); pl.insert(pl.end(), (uint8_t*)&blbe, (uint8_t*)&blbe+4);
+                            pl.insert(pl.end(), blob, blob + blen);
+                            uint64_t ns = r->nextNonce; uint8_t ns8[8]; for (int i=7;i>=0;--i){ ns8[i]=static_cast<uint8_t>(ns&0xFF); ns>>=8; }
+                            pl.insert(pl.end(), ns8, ns8+8);
+                            uint32_t ncbe = htonl(r->effectiveBatch); pl.insert(pl.end(), (uint8_t*)&ncbe, (uint8_t*)&ncbe+4);
+                            pl.insert(pl.end(), 32, 0);
+                            uint64_t t64 = saved.target(); uint8_t t8[8]; for (int i=7;i>=0;--i){ t8[i]=static_cast<uint8_t>(t64&0xFF); t64>>=8; }
+                            pl.insert(pl.end(), t8, t8+8);
+                            if (rx) { const auto &seed = saved.seed(); pl.insert(pl.end(), seed.data(), seed.data()+32); uint32_t hbe = htonl(static_cast<uint32_t>(saved.height())); pl.insert(pl.end(), (uint8_t*)&hbe, (uint8_t*)&hbe+4); }
+                            std::lock_guard<std::mutex> lk(r->sendMtx);
+                            send_frame(r->sock, 0x40 /*SLICE_LEASE_REQ*/, pl.data(), pl.size());
+                        } else {
+                            std::vector<uint8_t> pl; pl.reserve(2+1+8+1+4+4 + blen + 8 + 4 + 32 + 8 + (rx?32+4:0));
+                            pl.push_back('X'); pl.push_back('J'); pl.push_back(1);
+                            uint64_t jidbe = r->jobId; uint8_t tmp8[8]; for (int i=7;i>=0;--i){ tmp8[i]=static_cast<uint8_t>(jidbe & 0xFF); jidbe >>=8; }
+                            pl.insert(pl.end(), tmp8, tmp8+8);
+                            pl.push_back(rx ? 0x01 : 0x00);
+                            pl.push_back(nsize);
+                            uint32_t offbe = htonl(off); pl.insert(pl.end(), (uint8_t*)&offbe, (uint8_t*)&offbe+4);
+                            uint32_t blbe = htonl(static_cast<uint32_t>(blen)); pl.insert(pl.end(), (uint8_t*)&blbe, (uint8_t*)&blbe+4);
+                            pl.insert(pl.end(), blob, blob + blen);
+                            uint64_t ns = r->nextNonce; uint8_t ns8[8]; for (int i=7;i>=0;--i){ ns8[i]=static_cast<uint8_t>(ns&0xFF); ns>>=8; }
+                            pl.insert(pl.end(), ns8, ns8+8);
+                            uint32_t ncbe = htonl(r->effectiveBatch); pl.insert(pl.end(), (uint8_t*)&ncbe, (uint8_t*)&ncbe+4);
+                            pl.insert(pl.end(), 32, 0);
+                            uint64_t t64 = saved.target(); uint8_t t8[8]; for (int i=7;i>=0;--i){ t8[i]=static_cast<uint8_t>(t64&0xFF); t64>>=8; }
+                            pl.insert(pl.end(), t8, t8+8);
+                            if (rx) { const auto &seed = saved.seed(); pl.insert(pl.end(), seed.data(), seed.data()+32); uint32_t hbe = htonl(static_cast<uint32_t>(saved.height())); pl.insert(pl.end(), (uint8_t*)&hbe, (uint8_t*)&hbe+4); }
                             std::lock_guard<std::mutex> lk(r->sendMtx);
                             send_frame(r->sock, 0x10 /*JOB_SUBMIT*/, pl.data(), pl.size());
                         }
@@ -410,6 +462,64 @@ void RemoteBackend::start(IWorker *, bool) {
                                 uint64_t nbe = 0; for (int i=0;i<8;i++) nbe = (nbe<<8) | pay[8+i];
                                 uint32_t nonce = static_cast<uint32_t>(nbe);
                                 if (jid == r->jobId) { JobResults::submit(d->jobCopy, nonce, pay.data()+16); }
+                            }
+                        } else if (op == 0x41 /*SLICE_ACK*/) {
+                            // no-op for now
+                        } else if (op == 0x43 /*SLICE_DONE_EXT*/) {
+                            if (pay.size() >= 8+8+8+8+4) {
+                                uint64_t jid = 0; for (int i=8;i<16;i++) jid = (jid<<8) | pay[i];
+                                if (jid == r->jobId) {
+                                    uint64_t durMs = 0; for (int i=24;i<32;i++) durMs = (durMs<<8) | pay[i];
+                                    uint64_t nowMs = static_cast<uint64_t>(
+                                        std::chrono::duration_cast<std::chrono::milliseconds>(
+                                            std::chrono::steady_clock::now().time_since_epoch()).count());
+                                    uint64_t dtMs = durMs > 0 ? durMs : (nowMs > r->lastSubmitMs ? (nowMs - r->lastSubmitMs) : 0);
+                                    if (dtMs > 0) {
+                                        const char *tgtEnv = ::getenv("P2PRIG_TUNE_TARGET_MS");
+                                        const char *pctEnv = ::getenv("P2PRIG_TUNE_STEP_PCT");
+                                        double target = tgtEnv ? static_cast<double>(::strtoul(tgtEnv, nullptr, 10)) : 800.0;
+                                        double stepPct = pctEnv ? static_cast<double>(::strtoul(pctEnv, nullptr, 10)) : 10.0;
+                                        double alpha = 0.2;
+                                        double dt = static_cast<double>(dtMs);
+                                        r->doneEwmaMs = (r->doneEwmaMs <= 0.0) ? dt : (alpha * dt + (1.0 - alpha) * r->doneEwmaMs);
+                                        double lo = 0.9 * target;
+                                        double hi = 1.1 * target;
+                                        uint64_t newBatch = r->effectiveBatch;
+                                        if (r->doneEwmaMs < lo) newBatch = static_cast<uint64_t>(static_cast<double>(r->effectiveBatch) * (1.0 + (stepPct / 100.0)));
+                                        else if (r->doneEwmaMs > hi) newBatch = static_cast<uint64_t>(static_cast<double>(r->effectiveBatch) * (1.0 - (stepPct / 100.0)));
+                                        if (newBatch < 1) newBatch = 1;
+                                        if (r->deviceMaxBatch > 0 && newBatch > r->deviceMaxBatch) newBatch = r->deviceMaxBatch;
+                                        r->effectiveBatch = static_cast<uint32_t>(newBatch);
+                                    }
+                                    uint64_t start;
+                                    { std::lock_guard<std::mutex> lk(d->allocMtx); start = d->globalNonceNext; d->globalNonceNext += r->effectiveBatch; }
+                                    r->nextNonce = start;
+                                    const Job &job = d->jobCopy; const bool rx = (job.algorithm().family() == Algorithm::RANDOM_X);
+                                    const uint8_t *blob = job.blob(); size_t blen = job.size();
+                                    const uint32_t off = static_cast<uint32_t>(job.nonceOffset());
+                                    const uint8_t nsize = static_cast<uint8_t>(job.nonceSize());
+                                    std::vector<uint8_t> pl2; pl2.reserve(2+1+8+8+1+1+4+4 + blen + 8 + 4 + 32 + 8 + (rx?32+4:0));
+                                    pl2.push_back('X'); pl2.push_back('L'); pl2.push_back(1);
+                                    uint64_t sliceId2 = r->nextSliceId++; uint8_t sidb[8]; for (int i=7;i>=0;--i){ sidb[i]=static_cast<uint8_t>(sliceId2 & 0xFF); sliceId2 >>=8; }
+                                    pl2.insert(pl2.end(), sidb, sidb+8);
+                                    uint64_t jidbe = r->jobId; uint8_t jb[8]; for (int i=7;i>=0;--i){ jb[i]=static_cast<uint8_t>(jidbe & 0xFF); jidbe >>=8; }
+                                    pl2.insert(pl2.end(), jb, jb+8);
+                                    pl2.push_back(rx ? 0x01 : 0x00);
+                                    pl2.push_back(nsize);
+                                    uint32_t offbe = htonl(off); pl2.insert(pl2.end(), (uint8_t*)&offbe, (uint8_t*)&offbe+4);
+                                    uint32_t blbe = htonl(static_cast<uint32_t>(blen)); pl2.insert(pl2.end(), (uint8_t*)&blbe, (uint8_t*)&blbe+4);
+                                    pl2.insert(pl2.end(), blob, blob + blen);
+                                    uint64_t ns = r->nextNonce; uint8_t ns8[8]; for (int i=7;i>=0;--i){ ns8[i]=static_cast<uint8_t>(ns&0xFF); ns>>=8; }
+                                    pl2.insert(pl2.end(), ns8, ns8+8);
+                                    uint32_t ncbe = htonl(r->effectiveBatch); pl2.insert(pl2.end(), (uint8_t*)&ncbe, (uint8_t*)&ncbe+4);
+                                    pl2.insert(pl2.end(), 32, 0);
+                                    uint64_t t64 = job.target(); uint8_t t8[8]; for (int i=7;i>=0;--i){ t8[i]=static_cast<uint8_t>(t64&0xFF); t64>>=8; }
+                                    pl2.insert(pl2.end(), t8, t8+8);
+                                    if (rx) { const auto &seed = job.seed(); pl2.insert(pl2.end(), seed.data(), seed.data()+32); uint32_t hbe = htonl(static_cast<uint32_t>(job.height())); pl2.insert(pl2.end(), (uint8_t*)&hbe, (uint8_t*)&hbe+4); }
+                                    std::lock_guard<std::mutex> lk(r->sendMtx);
+                                    send_frame(r->sock, 0x40 /*SLICE_LEASE_REQ*/, pl2.data(), pl2.size());
+                                    r->lastSubmitMs = nowMs;
+                                }
                             }
                         } else if (op == 0x13 /*DONE*/) {
                             if (pay.size() >= 8+8) {
@@ -446,24 +556,47 @@ void RemoteBackend::start(IWorker *, bool) {
                                     const uint8_t *blob = job.blob(); size_t blen = job.size();
                                     const uint32_t off = static_cast<uint32_t>(job.nonceOffset());
                                     const uint8_t nsize = static_cast<uint8_t>(job.nonceSize());
-                                    std::vector<uint8_t> pl2; pl2.reserve(2+1+8+1+4+4 + blen + 8 + 4 + 32 + 8 + (rx?32+4:0));
-                                    pl2.push_back('X'); pl2.push_back('J'); pl2.push_back(1);
-                                    uint64_t jidbe = r->jobId; uint8_t tmp8[8]; for (int i=7;i>=0;--i){ tmp8[i]=static_cast<uint8_t>(jidbe & 0xFF); jidbe >>=8; }
-                                    pl2.insert(pl2.end(), tmp8, tmp8+8);
-                                    pl2.push_back(rx ? 0x01 : 0x00);
-                                    pl2.push_back(nsize);
-                                    uint32_t offbe = htonl(off); pl2.insert(pl2.end(), (uint8_t*)&offbe, (uint8_t*)&offbe+4);
-                                    uint32_t blbe = htonl(static_cast<uint32_t>(blen)); pl2.insert(pl2.end(), (uint8_t*)&blbe, (uint8_t*)&blbe+4);
-                                    pl2.insert(pl2.end(), blob, blob + blen);
-                                    uint64_t ns = r->nextNonce; uint8_t ns8[8]; for (int i=7;i>=0;--i){ ns8[i]=static_cast<uint8_t>(ns&0xFF); ns>>=8; }
-                                    pl2.insert(pl2.end(), ns8, ns8+8);
-                                    uint32_t ncbe = htonl(r->effectiveBatch); pl2.insert(pl2.end(), (uint8_t*)&ncbe, (uint8_t*)&ncbe+4);
-                                    pl2.insert(pl2.end(), 32, 0);
-                                    uint64_t t64 = job.target(); uint8_t t8[8]; for (int i=7;i>=0;--i){ t8[i]=static_cast<uint8_t>(t64&0xFF); t64>>=8; }
-                                    pl2.insert(pl2.end(), t8, t8+8);
-                                    if (rx) { const auto &seed = job.seed(); pl2.insert(pl2.end(), seed.data(), seed.data()+32); uint32_t hbe = htonl(static_cast<uint32_t>(job.height())); pl2.insert(pl2.end(), (uint8_t*)&hbe, (uint8_t*)&hbe+4); }
-                                    std::lock_guard<std::mutex> lk(r->sendMtx);
-                                    send_frame(r->sock, 0x10 /*JOB_SUBMIT*/, pl2.data(), pl2.size());
+                                    if (r->lease) {
+                                        std::vector<uint8_t> pl2; pl2.reserve(2+1+8+8+1+1+4+4 + blen + 8 + 4 + 32 + 8 + (rx?32+4:0));
+                                        pl2.push_back('X'); pl2.push_back('L'); pl2.push_back(1);
+                                        uint64_t sliceId = r->nextSliceId++; uint8_t sid8[8]; for (int i=7;i>=0;--i){ sid8[i]=static_cast<uint8_t>(sliceId & 0xFF); sliceId >>=8; }
+                                        pl2.insert(pl2.end(), sid8, sid8+8);
+                                        uint64_t jidbe = r->jobId; uint8_t j8[8]; for (int i=7;i>=0;--i){ j8[i]=static_cast<uint8_t>(jidbe & 0xFF); jidbe >>=8; }
+                                        pl2.insert(pl2.end(), j8, j8+8);
+                                        pl2.push_back(rx ? 0x01 : 0x00);
+                                        pl2.push_back(nsize);
+                                        uint32_t offbe = htonl(off); pl2.insert(pl2.end(), (uint8_t*)&offbe, (uint8_t*)&offbe+4);
+                                        uint32_t blbe = htonl(static_cast<uint32_t>(blen)); pl2.insert(pl2.end(), (uint8_t*)&blbe, (uint8_t*)&blbe+4);
+                                        pl2.insert(pl2.end(), blob, blob + blen);
+                                        uint64_t ns = r->nextNonce; uint8_t ns8[8]; for (int i=7;i>=0;--i){ ns8[i]=static_cast<uint8_t>(ns&0xFF); ns>>=8; }
+                                        pl2.insert(pl2.end(), ns8, ns8+8);
+                                        uint32_t ncbe = htonl(r->effectiveBatch); pl2.insert(pl2.end(), (uint8_t*)&ncbe, (uint8_t*)&ncbe+4);
+                                        pl2.insert(pl2.end(), 32, 0);
+                                        uint64_t t64 = job.target(); uint8_t t8[8]; for (int i=7;i>=0;--i){ t8[i]=static_cast<uint8_t>(t64&0xFF); t64>>=8; }
+                                        pl2.insert(pl2.end(), t8, t8+8);
+                                        if (rx) { const auto &seed = job.seed(); pl2.insert(pl2.end(), seed.data(), seed.data()+32); uint32_t hbe = htonl(static_cast<uint32_t>(job.height())); pl2.insert(pl2.end(), (uint8_t*)&hbe, (uint8_t*)&hbe+4); }
+                                        std::lock_guard<std::mutex> lk(r->sendMtx);
+                                        send_frame(r->sock, 0x40 /*SLICE_LEASE_REQ*/, pl2.data(), pl2.size());
+                                    } else {
+                                        std::vector<uint8_t> pl2; pl2.reserve(2+1+8+1+4+4 + blen + 8 + 4 + 32 + 8 + (rx?32+4:0));
+                                        pl2.push_back('X'); pl2.push_back('J'); pl2.push_back(1);
+                                        uint64_t jidbe = r->jobId; uint8_t tmp8[8]; for (int i=7;i>=0;--i){ tmp8[i]=static_cast<uint8_t>(jidbe & 0xFF); jidbe >>=8; }
+                                        pl2.insert(pl2.end(), tmp8, tmp8+8);
+                                        pl2.push_back(rx ? 0x01 : 0x00);
+                                        pl2.push_back(nsize);
+                                        uint32_t offbe = htonl(off); pl2.insert(pl2.end(), (uint8_t*)&offbe, (uint8_t*)&offbe+4);
+                                        uint32_t blbe = htonl(static_cast<uint32_t>(blen)); pl2.insert(pl2.end(), (uint8_t*)&blbe, (uint8_t*)&blbe+4);
+                                        pl2.insert(pl2.end(), blob, blob + blen);
+                                        uint64_t ns = r->nextNonce; uint8_t ns8[8]; for (int i=7;i>=0;--i){ ns8[i]=static_cast<uint8_t>(ns&0xFF); ns>>=8; }
+                                        pl2.insert(pl2.end(), ns8, ns8+8);
+                                        uint32_t ncbe = htonl(r->effectiveBatch); pl2.insert(pl2.end(), (uint8_t*)&ncbe, (uint8_t*)&ncbe+4);
+                                        pl2.insert(pl2.end(), 32, 0);
+                                        uint64_t t64 = job.target(); uint8_t t8[8]; for (int i=7;i>=0;--i){ t8[i]=static_cast<uint8_t>(t64&0xFF); t64>>=8; }
+                                        pl2.insert(pl2.end(), t8, t8+8);
+                                        if (rx) { const auto &seed = job.seed(); pl2.insert(pl2.end(), seed.data(), seed.data()+32); uint32_t hbe = htonl(static_cast<uint32_t>(job.height())); pl2.insert(pl2.end(), (uint8_t*)&hbe, (uint8_t*)&hbe+4); }
+                                        std::lock_guard<std::mutex> lk(r->sendMtx);
+                                        send_frame(r->sock, 0x10 /*JOB_SUBMIT*/, pl2.data(), pl2.size());
+                                    }
                                     r->lastSubmitMs = nowMs;
                                 }
                             }
@@ -560,24 +693,26 @@ void RemoteBackend::start(IWorker *, bool) {
                     backoff = backoff < 30 ? (backoff * 2) : 30;
                     continue;
                 }
+                // Handshake OK
                 d->sock = fd2;
                 d->handshakeDone = true;
-                LOG_INFO("%s remote connected to %s:%d", Tags::miner(), d->host.c_str(), d->port);
                 d->lastRxMs.store(static_cast<uint64_t>(
                     std::chrono::duration_cast<std::chrono::milliseconds>(
                         std::chrono::steady_clock::now().time_since_epoch()).count()));
                 // Optional META peek
                 ::fcntl(d->sock, F_SETFL, O_NONBLOCK);
-                uint8_t pop2; std::vector<uint8_t> ppl2;
-                if (recv_frame(d->sock, pop2, ppl2)) {
-                    if (pop2 == 0x02 /*META_RESP*/ && !ppl2.empty()) {
-                        std::string json(reinterpret_cast<const char*>(ppl2.data()), ppl2.size());
-                        rapidjson::Document md; md.Parse(json.c_str());
-                        if (md.IsObject()) {
-                            if (md.HasMember("cpu_count") && md["cpu_count"].IsInt()) d->deviceCpuCount = md["cpu_count"].GetInt();
-                            if (md.HasMember("max_batch") && md["max_batch"].IsUint()) {
-                                d->deviceMaxBatch = md["max_batch"].GetUint();
-                                if (d->deviceMaxBatch > 0) d->batchSize = d->deviceMaxBatch;
+                {
+                    uint8_t pop2; std::vector<uint8_t> ppl2;
+                    if (recv_frame(d->sock, pop2, ppl2)) {
+                        if (pop2 == 0x02 /*META_RESP*/ && !ppl2.empty()) {
+                            std::string json(reinterpret_cast<const char*>(ppl2.data()), ppl2.size());
+                            rapidjson::Document md; md.Parse(json.c_str());
+                            if (md.IsObject()) {
+                                if (md.HasMember("cpu_count") && md["cpu_count"].IsInt()) d->deviceCpuCount = md["cpu_count"].GetInt();
+                                if (md.HasMember("max_batch") && md["max_batch"].IsUint()) {
+                                    d->deviceMaxBatch = md["max_batch"].GetUint();
+                                    if (d->deviceMaxBatch > 0) d->batchSize = d->deviceMaxBatch;
+                                }
                             }
                         }
                     }
@@ -634,8 +769,9 @@ void RemoteBackend::start(IWorker *, bool) {
                 if (d->sock >= 0) { ::close(d->sock); d->sock = -1; }
                 d->handshakeDone = false;
                 // Reconnect with backoff
-                int backoff = 1;
+                int backoff = 0;
                 while (!d->stopRx) {
+                    if (backoff > 0) { std::this_thread::sleep_for(std::chrono::seconds(backoff)); backoff = backoff < 30 ? (backoff * 2) : 30; } else { backoff = 1; }
                     // Resolve
                     struct addrinfo hints{}; memset(&hints, 0, sizeof(hints));
                     hints.ai_socktype = SOCK_STREAM; hints.ai_family = AF_UNSPEC;
@@ -644,9 +780,10 @@ void RemoteBackend::start(IWorker *, bool) {
                     int rc = ::getaddrinfo(d->host.c_str(), portbuf, &hints, &res);
                     if (rc != 0) {
                         LOG_ERR("remote: resolve %s:%d failed: %s", d->host.c_str(), d->port, gai_strerror(rc));
-                        goto sleep_and_retry;
+                        continue;
                     }
                     // Connect
+                    {
                     int fd2 = -1;
                     for (auto it = res; it; it = it->ai_next) {
                         fd2 = ::socket(it->ai_family, it->ai_socktype, it->ai_protocol);
@@ -655,9 +792,10 @@ void RemoteBackend::start(IWorker *, bool) {
                         ::close(fd2); fd2 = -1;
                     }
                     ::freeaddrinfo(res);
+                    res = nullptr;
                     if (fd2 < 0) {
                         LOG_ERR("remote: connect %s:%d failed: %s", d->host.c_str(), d->port, strerror(errno));
-                        goto sleep_and_retry;
+                        continue;
                     }
                     // HELLO
                     uint16_t ver = htons(1);
@@ -671,21 +809,21 @@ void RemoteBackend::start(IWorker *, bool) {
                     if (!send_frame(fd2, 0x30 /*CLIENT_HELLO*/, hello.data(), hello.size())) {
                         LOG_ERR("remote: send CLIENT_HELLO failed: %s", strerror(errno));
                         ::close(fd2);
-                        goto sleep_and_retry;
+                        continue;
                     }
                     // Read SERVER_HELLO
                     uint8_t hdr2[8]; ssize_t r2 = ::read(fd2, hdr2, 8);
-                    if (r2 != 8) { ::close(fd2); goto sleep_and_retry; }
+                    if (r2 != 8) { ::close(fd2); continue; }
                     uint64_t len2 = 0; for (int i=0;i<8;i++){ len2 = (len2<<8) | hdr2[i]; }
-                    uint8_t op2 = 0; if (::read(fd2, &op2, 1) != 1) { ::close(fd2); goto sleep_and_retry; }
+                    uint8_t op2 = 0; if (::read(fd2, &op2, 1) != 1) { ::close(fd2); continue; }
                     std::vector<uint8_t> pl2;
                     if (len2 > 1) {
                         pl2.resize(static_cast<size_t>(len2-1));
-                        if (::read(fd2, pl2.data(), pl2.size()) != static_cast<ssize_t>(pl2.size())) { ::close(fd2); goto sleep_and_retry; }
+                        if (::read(fd2, pl2.data(), pl2.size()) != static_cast<ssize_t>(pl2.size())) { ::close(fd2); continue; }
                     }
                     if (op2 == 0x7F /*ERROR*/ || op2 != 0x31 /*SERVER_HELLO*/ || pl2.size() < 2+4+1) {
                         ::close(fd2);
-                        goto sleep_and_retry;
+                        continue;
                     }
                     d->sock = fd2;
                     d->handshakeDone = true;
@@ -757,11 +895,7 @@ void RemoteBackend::start(IWorker *, bool) {
                     // reset backoff
                     backoff = 1;
                     break; // re-enter read loop
-
-                sleep_and_retry:
-                    std::this_thread::sleep_for(std::chrono::seconds(backoff));
-                    backoff = backoff < 30 ? (backoff * 2) : 30;
-                    if (res) { ::freeaddrinfo(res); res = nullptr; }
+                    }
                 }
                 if (d->stopRx) break; // stop requested
                 continue;

@@ -60,6 +60,12 @@ static inline const std::string &usage()
     u += "  -6, --ipv6                    resolve names to IPv6 addresses\n";
     u += "      --dns-ttl=N               N seconds (default: 30) TTL for internal DNS cache\n";
 
+    u += "\nRemote backend:\n";
+    u += "      --remote-host=HOST        remote device-daemon host\n";
+    u += "      --remote-port=N           remote device-daemon port\n";
+    u += "      --remote-token=T          authentication token for remote device (optional)\n";
+    u += "      --remote-batch=N          override batch size per job for remote device\n";
+
 #   ifdef XMRIG_FEATURE_HTTP
     u += "      --daemon                  use daemon RPC instead of pool for solo mining\n";
     u += "      --daemon-zmq-port=N       daemon's zmq-pub port number (only use it if daemon has it enabled)\n";

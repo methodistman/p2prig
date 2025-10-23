@@ -68,8 +68,14 @@
 #define OPC_SERVER_HELLO 0x31
 #define OPC_ERROR        0x7F
 
+// Lease/ACK protocol (Phase A)
+#define OPC_SLICE_LEASE_REQ 0x40
+#define OPC_SLICE_ACK       0x41
+#define OPC_SLICE_DONE_EXT  0x43
+
 typedef struct {
     uint64_t job_id;
+    uint64_t slice_id; // 0 when not using Lease/ACK
     unsigned char header[80];
     unsigned char target[32];
     uint64_t nonce_start;
@@ -671,6 +677,8 @@ static void* worker_thread(void* arg) {
         job_t* j = dequeue_job();
         if (!j) continue;
         uint64_t processed = 0;
+        uint32_t shares_found = 0;
+        struct timespec ts0; clock_gettime(CLOCK_MONOTONIC, &ts0);
         // Extended mode local buffer
         unsigned char *buf = NULL;
         if (j->blob_len > 0) {
@@ -723,6 +731,7 @@ static void* worker_thread(void* arg) {
                 if (0 == send_frame_locked(ctx, OPC_RESULT, payload, sizeof(payload))) {
                     __sync_add_and_fetch(&g_ctr_results, 1);
                 }
+                shares_found++;
             }
             processed++;
             // optional: throttle yield to allow cancel handling
@@ -732,14 +741,27 @@ static void* worker_thread(void* arg) {
                 nanosleep(&ts, NULL);
             }
         }
-        // send DONE: job_id || processed_count
-        unsigned char donep[8+8];
-        uint64_t jid = htobe64(j->job_id);
-        memcpy(donep, &jid, 8);
-        uint64_t pbe = htobe64(processed);
-        memcpy(donep+8, &pbe, 8);
-        if (0 == send_frame_locked(ctx, OPC_DONE, donep, sizeof(donep))) {
+        // send finalization for lease or legacy DONE
+        if (j->slice_id != 0) {
+            struct timespec ts1; clock_gettime(CLOCK_MONOTONIC, &ts1);
+            uint64_t dur_ms = (uint64_t)((ts1.tv_sec - ts0.tv_sec) * 1000ULL + (ts1.tv_nsec - ts0.tv_nsec) / 1000000ULL);
+            unsigned char fin[8+8+8+8+4];
+            uint64_t sid = htobe64(j->slice_id); memcpy(fin, &sid, 8);
+            uint64_t jid = htobe64(j->job_id); memcpy(fin+8, &jid, 8);
+            uint64_t pbe = htobe64(processed); memcpy(fin+16, &pbe, 8);
+            uint64_t dbe = htobe64(dur_ms); memcpy(fin+24, &dbe, 8);
+            uint32_t sbe = htobe32(shares_found); memcpy(fin+32, &sbe, 4);
+            send_frame_locked(ctx, OPC_SLICE_DONE_EXT, fin, sizeof(fin));
             __sync_add_and_fetch(&g_ctr_done, 1);
+        } else {
+            unsigned char donep[8+8];
+            uint64_t jid = htobe64(j->job_id);
+            memcpy(donep, &jid, 8);
+            uint64_t pbe = htobe64(processed);
+            memcpy(donep+8, &pbe, 8);
+            if (0 == send_frame_locked(ctx, OPC_DONE, donep, sizeof(donep))) {
+                __sync_add_and_fetch(&g_ctr_done, 1);
+            }
         }
         jobs_remove(j->job_id);
         if (buf) free(buf);
@@ -817,6 +839,7 @@ static void handle_connection(int cfd) {
                     #ifdef HAVE_RANDOMX
                         scaps |= 0x1u; // RANDOMX
                     #endif
+                    scaps |= 0x2u; // LEASE/ACK
                     uint32_t scbe = htobe32(scaps);
                     uint8_t auth_req = (g_auth_token && *g_auth_token) ? 1 : 0;
                     unsigned char sh[2+4+1];
@@ -853,6 +876,7 @@ static void handle_connection(int cfd) {
                             #ifdef HAVE_RANDOMX
                                 scaps |= 0x1u;
                             #endif
+                            scaps |= 0x2u; // LEASE/ACK
                             uint32_t scbe = htobe32(scaps);
                             uint8_t auth_req = (g_auth_token && *g_auth_token) ? 1 : 0;
                             unsigned char sh[2+4+1];
@@ -998,6 +1022,53 @@ static void handle_connection(int cfd) {
             jobs_add(j->job_id, j);
             if (enqueue_job(j) != 0) { jobs_remove(j->job_id); if (j->blob) free(j->blob); free(j); __sync_add_and_fetch(&g_ctr_jobs_drop, 1); }
             else { __sync_add_and_fetch(&g_ctr_jobs_enq, 1); }
+        } else if (opcode == OPC_SLICE_LEASE_REQ) {
+            // Lease request: 'X''L' ver(1) | slice_id(8) | job_id(8) | flags(1) | nonce_size(1) | nonce_off(4) | blob_len(4) | blob[...] | nonce_start(8) | nonce_count(4) | target32(32) | target64(8) | [rx_seed(32) rx_height(4)]
+            if (payload_len < (2+1+8+8+1+1+4+4+8+4+32+8)) { free(p); goto next_frame; }
+            uint8_t *pp = p;
+            if (!(pp[0]=='X' && pp[1]=='L')) { free(p); goto next_frame; }
+            pp += 2;
+            uint8_t ver = *pp++; (void)ver;
+            uint64_t sid; memcpy(&sid, pp, 8); pp += 8; uint64_t slice_id = be64toh(sid);
+            uint64_t jid; memcpy(&jid, pp, 8); pp += 8; uint64_t job_id = be64toh(jid);
+            job_t* j = calloc(1, sizeof(job_t)); if (!j) { free(p); goto next_frame; }
+            j->slice_id = slice_id; j->job_id = job_id;
+            j->flags = *pp++;
+            j->nonce_size = *pp++;
+            uint32_t offbe; memcpy(&offbe, pp, 4); pp += 4; j->nonce_off = be32toh(offbe);
+            uint32_t blbe; memcpy(&blbe, pp, 4); pp += 4; j->blob_len = be32toh(blbe);
+            if ((size_t)(pp - p) + j->blob_len + 8 + 4 + 32 + 8 > payload_len) { free(j); free(p); goto next_frame; }
+            if (j->blob_len > 0) { j->blob = (unsigned char*)malloc(j->blob_len); if (!j->blob) { free(j); free(p); goto next_frame; } memcpy(j->blob, pp, j->blob_len); }
+            pp += j->blob_len;
+            uint64_t ns; memcpy(&ns, pp, 8); pp += 8; j->nonce_start = be64toh(ns);
+            uint32_t nc; memcpy(&nc, pp, 4); pp += 4; j->nonce_count = be32toh(nc);
+            if (g_max_batch > 0 && j->nonce_count > g_max_batch) j->nonce_count = g_max_batch;
+            memcpy(j->target, pp, 32); pp += 32;
+            if ((size_t)(pp - p) + 8 <= payload_len) { uint64_t t64; memcpy(&t64, pp, 8); pp += 8; j->target64 = be64toh(t64); }
+#ifdef HAVE_RANDOMX
+            if (j->flags & 0x01) {
+                if ((size_t)(pp - p) + 32 + 4 <= payload_len) {
+                    memcpy(j->rx_seed, pp, 32); pp += 32;
+                    uint32_t bhe; memcpy(&bhe, pp, 4); pp += 4; j->rx_height = be32toh(bhe);
+                } else {
+                    j->flags &= ~0x01;
+                }
+            }
+#endif
+            jobs_add(j->job_id, j);
+            if (enqueue_job(j) != 0) { jobs_remove(j->job_id); if (j->blob) free(j->blob); free(j); __sync_add_and_fetch(&g_ctr_jobs_drop, 1); }
+            else {
+                __sync_add_and_fetch(&g_ctr_jobs_enq, 1);
+                // Send SLICE_ACK: slice_id | accepted | reason | start_ts_ms
+                struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
+                uint64_t now_ms = (uint64_t)ts.tv_sec*1000ULL + (uint64_t)(ts.tv_nsec/1000000ULL);
+                unsigned char ack[8+1+1+8];
+                uint64_t sidbe = htobe64(slice_id); memcpy(ack, &sidbe, 8);
+                ack[8] = 1; // accepted
+                ack[9] = 0; // reason none
+                uint64_t st = htobe64(now_ms); memcpy(ack+10, &st, 8);
+                send_frame_locked(ctx, OPC_SLICE_ACK, ack, sizeof(ack));
+            }
         } else if (opcode == OPC_JOB_ABORT) {
             if (payload_len >= 8){
                 uint64_t jid; memcpy(&jid, p, 8); uint64_t job_id = be64toh(jid);
@@ -1012,7 +1083,8 @@ static void handle_connection(int cfd) {
             send_frame_locked(ctx, OPC_META_RESP, meta, (uint64_t)meta_len);
         }
         free(p);
-    }
+next_frame:
+        }
 conn_close:
     #ifdef HAVE_OPENSSL
     if (ctx->ssl) { SSL_shutdown(ctx->ssl); SSL_free(ctx->ssl); ctx->ssl = NULL; }

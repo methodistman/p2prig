@@ -19,6 +19,11 @@
 #include "core/Controller.h"
 #include "backend/cpu/Cpu.h"
 #include "core/config/Config.h"
+#include "base/io/log/Log.h"
+#include "base/io/log/Tags.h"
+#ifdef XMRIG_FEATURE_PEER
+#   include "peer/PeerServer.h"
+#endif
 #include "core/Miner.h"
 #include "crypto/common/VirtualMemory.h"
 #include "net/Network.h"
@@ -68,6 +73,25 @@ void xmrig::Controller::start()
 
     m_miner = std::make_shared<Miner>(this);
 
+#ifdef XMRIG_FEATURE_PEER
+    if (config()->peerEnabled()) {
+        peer::PeerServerConfig pcfg;
+        pcfg.bindAddress = config()->peerBind();
+        pcfg.port        = config()->peerPort();
+        pcfg.token       = config()->peerToken() ? config()->peerToken() : "";
+        pcfg.tls         = false;
+
+        m_peerServer.reset(new peer::PeerServer(m_miner.get()));
+        if (m_peerServer->start(pcfg)) {
+            LOG_INFO("%s peer server listening on %s:%u", Tags::network(), pcfg.bindAddress.c_str(), static_cast<unsigned>(pcfg.port));
+        }
+        else {
+            LOG_ERR("%s failed to start peer server on %s:%u", Tags::network(), pcfg.bindAddress.c_str(), static_cast<unsigned>(pcfg.port));
+            m_peerServer.reset();
+        }
+    }
+#endif
+
     network()->connect();
 }
 
@@ -75,6 +99,10 @@ void xmrig::Controller::start()
 void xmrig::Controller::stop()
 {
     Base::stop();
+
+#ifdef XMRIG_FEATURE_PEER
+    m_peerServer.reset();
+#endif
 
     m_network.reset();
 
@@ -97,6 +125,13 @@ xmrig::Network *xmrig::Controller::network() const
 
     return m_network.get();
 }
+
+#ifdef XMRIG_FEATURE_PEER
+xmrig::peer::PeerServer* xmrig::Controller::peerServer() const
+{
+    return m_peerServer.get();
+}
+#endif
 
 
 void xmrig::Controller::execCommand(char command) const

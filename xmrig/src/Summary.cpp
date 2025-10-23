@@ -19,6 +19,7 @@
 #include <cinttypes>
 #include <cstdio>
 #include <uv.h>
+#include <cstdlib>
 
 
 #include "backend/cpu/Cpu.h"
@@ -185,6 +186,19 @@ static void print_threads(const Config *config)
 }
 
 
+static void print_remote()
+{
+    const char *host = std::getenv("P2PRIG_HOST");
+    const char *port = std::getenv("P2PRIG_PORT");
+    if (host && *host && port && *port) {
+        Log::print(GREEN_BOLD(" * ") WHITE_BOLD("%-13s") "%s:%s",
+                   "REMOTE",
+                   host,
+                   port);
+    }
+}
+
+
 static void print_commands(Config *)
 {
     if (Log::isColors()) {
@@ -213,6 +227,7 @@ void xmrig::Summary::print(Controller *controller)
     print_cpu(config);
     print_memory(config);
     print_threads(config);
+    print_remote();
     config->pools().print();
 
     print_commands(config);

@@ -2,7 +2,7 @@ Package: xmrig-remote
 Version: 6.21.0+remote1
 Architecture: amd64
 Maintainer: Gregory <gregory@example.com>
-Installed-Size: 5477
+Installed-Size: 4308
 Depends: libc6 (>= 2.38), libssl3t64 (>= 3.0.0)
 Section: utils
 Priority: optional

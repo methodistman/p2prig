@@ -1,0 +1,9 @@
+{
+  "autosave": false,
+  "cpu": { "enabled": false },
+  "http": { "enabled": true, "host": "127.0.0.1", "port": 8082 },
+  "algo": "rx",
+  "pools": [
+    { "url": "benchmark:3333", "user": "bench", "pass": "x" }
+  ]
+}

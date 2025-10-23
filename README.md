@@ -11,6 +11,60 @@ A monorepo for a peer-to-peer mining setup:
 - xmrig/: XMRig miner with remote backend scaffold
 - docs/: Protocol, build, and packaging docs
 
+## Dependencies
+
+### Common (Debian/Ubuntu)
+
+- build-essential, pkg-config, git, cmake
+- Install with:
+  ```bash
+  sudo apt-get update
+  sudo apt-get install -y build-essential pkg-config git cmake
+  ```
+
+### XMRig (miner) build/runtime
+
+- libuv1-dev, libssl-dev
+- Install with:
+  ```bash
+  sudo apt-get install -y libuv1-dev libssl-dev
+  ```
+- Notes:
+  - Default build here disables optional features: `-DWITH_OPENCL=OFF -DWITH_CUDA=OFF -DWITH_HWLOC=OFF`.
+  - If you enable them, you must install corresponding SDKs/dev headers and drivers on your system.
+  - XMRig’s TLS Stratum requires OpenSSL; `libssl-dev` provides headers for build and pulls in runtime libs.
+
+### device-daemon (native Linux)
+
+- Optional RandomX acceleration via `librandomx`:
+  ```bash
+  sudo apt-get install -y librandomx-dev
+  ```
+- Build examples (see `docs/BUILDING.md` for full commands):
+  - Without RandomX: `gcc -O2 -pthread -o device_daemon device_daemon.c`
+  - With RandomX: `gcc -O2 -pthread -DHAVE_RANDOMX -o device_daemon device_daemon.c -lrandomx`
+- Runtime libs: glibc, pthread; when linking with RandomX also `librandomx` (and `dl`, `m` as needed by toolchain).
+
+### Cross-building device-daemon for arm64
+
+- Debian multiarch toolchains and RandomX (arm64):
+  ```bash
+  sudo dpkg --add-architecture arm64
+  sudo apt-get update
+  sudo apt-get install -y crossbuild-essential-arm64 gcc-aarch64-linux-gnu librandomx-dev:arm64
+  ```
+
+### Android (aarch64/Termux)
+
+- Android NDK r26d (or newer) for aarch64 toolchains.
+- Build RandomX for Android and point includes/libs accordingly.
+- See `docs/BUILDING.md` for the exact clang wrapper invocations and linker flags.
+
+### Performance/system prerequisites
+
+- RandomX benefits from huge pages on Linux; consider configuring `nr_hugepages` for best performance.
+- Ensure CPU governor and power settings allow sustained performance if benchmarking.
+
 ## Quick start
 
 - Build and run XMRig locally (amd64):

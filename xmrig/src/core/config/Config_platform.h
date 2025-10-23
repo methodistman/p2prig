@@ -99,6 +99,11 @@ static const option options[] = {
     { "ipv4",                  0, nullptr, IConfig::DnsIPv4Key            },
     { "ipv6",                  0, nullptr, IConfig::DnsIPv6Key            },
     { "dns-ttl",               1, nullptr, IConfig::DnsTtlKey             },
+    // Remote backend (custom, consumed in Process to env)
+    { "remote-host",           1, nullptr, 10001                          },
+    { "remote-port",           1, nullptr, 10002                          },
+    { "remote-token",          1, nullptr, 10003                          },
+    { "remote-batch",          1, nullptr, 10004                          },
     { "spend-secret-key",      1, nullptr, IConfig::SpendSecretKey        },
 #   ifdef XMRIG_FEATURE_BENCHMARK
     { "stress",                0, nullptr, IConfig::StressKey             },
@@ -162,6 +167,11 @@ static const option options[] = {
 #   ifdef XMRIG_FEATURE_DMI
     { "no-dmi",                0, nullptr, IConfig::DmiKey                },
 #   endif
+    // peer
+    { "peer",                  0, nullptr, IConfig::PeerEnableKey         },
+    { "peer-bind",             1, nullptr, IConfig::PeerBindKey           },
+    { "peer-port",             1, nullptr, IConfig::PeerPortKey           },
+    { "peer-token",            1, nullptr, IConfig::PeerTokenKey          },
     { nullptr,                 0, nullptr, 0 }
 };
 

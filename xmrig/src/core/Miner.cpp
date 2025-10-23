@@ -55,9 +55,12 @@
 #endif
 
 #ifdef XMRIG_FEATURE_REMOTE
-#   include "backend/remote/RemoteBackend.h"
+    #include "backend/remote/RemoteBackend.h"
 #endif
 
+#ifdef XMRIG_FEATURE_PEER
+    #include "peer/PeerServer.h"
+#endif
 #ifdef XMRIG_ALGO_RANDOMX
 #   include "crypto/rx/Profiler.h"
 #   include "crypto/rx/Rx.h"
@@ -431,9 +434,18 @@ xmrig::Miner::Miner(Controller *controller)
 
 #   ifdef XMRIG_FEATURE_REMOTE
     d_ptr->backends.push_back(new RemoteBackend(controller));
-#   endif
+#endif
 
     d_ptr->rebuild();
+
+#ifdef XMRIG_FEATURE_REMOTE
+    // Ensure RemoteBackend starts (env-driven) even if no CPU/GPU workers are created.
+    for (auto backend : d_ptr->backends) {
+        if (backend->type() == "remote") {
+            backend->start(nullptr, true);
+        }
+    }
+#endif
 }
 
 
@@ -716,6 +728,21 @@ void xmrig::Miner::onRequest(IApiRequest &request)
 
             d_ptr->getMiner(request.reply(), request.doc(), request.version());
             d_ptr->getHashrate(request.reply(), request.doc(), request.version());
+
+#ifdef XMRIG_FEATURE_PEER
+            using namespace rapidjson;
+            auto &allocator = request.doc().GetAllocator();
+            Value peer(kObjectType);
+            peer.AddMember("enabled", d_ptr->controller->config()->peerEnabled(), allocator);
+            peer.AddMember("bind", StringRef(d_ptr->controller->config()->peerBind()), allocator);
+            peer.AddMember("port", d_ptr->controller->config()->peerPort(), allocator);
+            uint32_t conns = 0;
+            if (auto *ps = d_ptr->controller->peerServer()) {
+                conns = ps->stats().connections.load();
+            }
+            peer.AddMember("connections", conns, allocator);
+            request.reply().AddMember("peer_server", peer, allocator);
+#endif
         }
         else if (request.url() == "/2/backends") {
             request.accept();

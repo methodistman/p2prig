@@ -265,6 +265,19 @@ void xmrig::ConfigTransform::transform(rapidjson::Document &doc, int key, const 
         return transformBenchmark(doc, key, arg);
 #   endif
 
+    // peer CLI
+    case IConfig::PeerEnableKey: /* --peer */
+        return set(doc, Config::kPeer, Config::kPeerEnabled, true);
+
+    case IConfig::PeerBindKey: /* --peer-bind */
+        return set(doc, Config::kPeer, Config::kPeerBind, arg);
+
+    case IConfig::PeerPortKey: /* --peer-port */
+        return set(doc, Config::kPeer, Config::kPeerPort, static_cast<uint64_t>(strtol(arg, nullptr, 10)));
+
+    case IConfig::PeerTokenKey: /* --peer-token */
+        return set(doc, Config::kPeer, Config::kPeerToken, arg);
+
     default:
         break;
     }

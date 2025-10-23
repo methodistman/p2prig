@@ -19,6 +19,7 @@
 #include <ctime>
 #include <string>
 #include <uv.h>
+#include <cstdlib>
 
 
 #include "base/kernel/Process.h"
@@ -123,6 +124,20 @@ xmrig::Process::Process(int argc, char **argv) :
     srand(static_cast<unsigned int>(Chrono::currentMSecsSinceEpoch() ^ reinterpret_cast<uintptr_t>(this)));
 
     setDataDir(m_arguments.value("--data-dir", "-d"));
+
+    // Remote backend CLI -> environment bridge
+    if (const char *v = m_arguments.value("--remote-host")) {
+        setenv("P2PRIG_HOST", v, 1);
+    }
+    if (const char *v = m_arguments.value("--remote-port")) {
+        setenv("P2PRIG_PORT", v, 1);
+    }
+    if (const char *v = m_arguments.value("--remote-token")) {
+        setenv("P2PRIG_TOKEN", v, 1);
+    }
+    if (const char *v = m_arguments.value("--remote-batch")) {
+        setenv("P2PRIG_BATCH", v, 1);
+    }
 
 #   ifdef XMRIG_SHARED_DATADIR
     if (dataDir.empty()) {

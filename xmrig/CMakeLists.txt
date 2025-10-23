@@ -33,6 +33,7 @@ option(WITH_BENCHMARK       "Enable builtin RandomX benchmark and stress test" O
 option(WITH_SECURE_JIT      "Enable secure access to JIT memory" OFF)
 option(WITH_DMI             "Enable DMI/SMBIOS reader" ON)
 option(WITH_REMOTE          "Enable remote backend (experimental)" OFF)
+option(WITH_PEER            "Enable embedded peer server (experimental)" ON)
 
 option(BUILD_STATIC         "Build static binary" OFF)
 option(ARM_V8               "Force ARMv8 (64 bit) architecture, use with caution if automatic detection fails, but you sure it may work" OFF)
@@ -48,12 +49,14 @@ include (cmake/cpu.cmake)
 include (cmake/os.cmake)
 include (src/base/base.cmake)
 include (src/backend/backend.cmake)
+include (src/peer/peer.cmake)
 
 
 set(HEADERS
     "${HEADERS_BASE}"
     "${HEADERS_BASE_HTTP}"
     "${HEADERS_BACKEND}"
+    "${HEADERS_PEER}"
     src/App.h
     src/core/config/Config_default.h
     src/core/config/Config_platform.h
@@ -106,6 +109,7 @@ set(SOURCES
     "${SOURCES_BASE}"
     "${SOURCES_BASE_HTTP}"
     "${SOURCES_BACKEND}"
+    "${SOURCES_PEER}"
     src/App.cpp
     src/core/config/Config.cpp
     src/core/config/ConfigTransform.cpp

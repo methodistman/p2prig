@@ -34,6 +34,9 @@ class Job;
 class Miner;
 class Network;
 
+#ifdef XMRIG_FEATURE_PEER
+namespace peer { class PeerServer; }
+#endif
 
 class Controller : public Base
 {
@@ -51,9 +54,17 @@ public:
     Network *network() const;
     void execCommand(char command) const;
 
+#ifdef XMRIG_FEATURE_PEER
+    peer::PeerServer* peerServer() const;
+#endif
+
 private:
     std::shared_ptr<Miner> m_miner;
     std::shared_ptr<Network> m_network;
+
+#ifdef XMRIG_FEATURE_PEER
+    std::unique_ptr<peer::PeerServer> m_peerServer;
+#endif
 
 #   ifdef XMRIG_FEATURE_API
     std::shared_ptr<HwApi> m_hwApi;

@@ -163,6 +163,12 @@ public:
         CudaLoaderKey        = 1208,
         NvmlKey              = 1209,
         HealthPrintTimeKey   = 1210,
+
+        // peer (embedded server)
+        PeerEnableKey        = 1700,
+        PeerBindKey          = 1701,
+        PeerPortKey          = 1702,
+        PeerTokenKey         = 1703,
     };
 
     virtual ~IConfig() = default;

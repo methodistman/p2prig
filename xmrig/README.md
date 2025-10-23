@@ -36,3 +36,100 @@ The preferred way to configure the miner is the [JSON config file](https://xmrig
 * support@xmrig.com
 * [reddit](https://www.reddit.com/user/XMRig/)
 * [twitter](https://twitter.com/xmrig_dev)
+
+
+## PeerServer and Remote Backend (Experimental)
+
+This fork embeds an experimental Peer-to-Peer module to delegate RandomX work to local or remote peers from inside XMRig.
+
+- **PeerServer**: a lightweight libuv TCP server inside XMRig that accepts delegated work frames and executes them using RandomX.
+- **RemoteBackend**: an experimental backend that connects to one or more PeerServers and submits work slices.
+
+### Build
+
+Enable the features at configure time:
+
+```bash
+cmake -S . -B build \
+  -DWITH_PEER=ON \
+  -DWITH_REMOTE=ON \
+  -DWITH_BENCHMARK=ON \
+  -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
+```
+
+### Configuration
+
+Add the `peer` section to your JSON config to run the embedded server:
+
+```json
+{
+  "peer": {
+    "enabled": true,
+    "bind": "127.0.0.1",
+    "port": 9000
+  }
+}
+```
+
+Example minimal files in this repo:
+
+- `config.peer.json` – enables the PeerServer and HTTP API for inspection.
+- `config.remote.json` – standard miner config used for remote/bench examples.
+- `config.loopback.json` – minimal bench config to drive local validation with `-a rx`.
+
+### RemoteBackend (env-driven)
+
+The RemoteBackend is enabled by environment variables and starts automatically when present:
+
+- `P2PRIG_ENDPOINTS` – comma-separated endpoints: `host:port[:weight]` (e.g. `127.0.0.1:9000`, `10.0.0.2:9001:2`).
+- `P2PRIG_BATCH` – initial batch size (nonces per slice), default ~1,048,576.
+- `P2PRIG_TUNE_TARGET_MS` – target slice duration in ms for auto-tuning (default 800).
+- `P2PRIG_TUNE_STEP_PCT` – batch adjustment step percent (default 10).
+
+Start any normal XMRig run and set the variables, for example:
+
+```bash
+P2PRIG_ENDPOINTS=127.0.0.1:9000 \
+P2PRIG_BATCH=200000 \
+./xmrig -a rx -o stratum+ssl://rx.unmineable.com:443 \
+  -u BTT:TT5sFMQRKKb34DLht8L57sYtrebrcipBzv.unmineable_worker_dikyct \
+  -p x --http-host=127.0.0.1 --http-port=8082
+```
+
+### Loopback validation (bench-driven)
+
+1) Start the PeerServer:
+
+```bash
+./xmrig -c ./config.peer.json
+```
+
+2) Start a local client that connects back to the peer and drives small RandomX benchmarks:
+
+```bash
+P2PRIG_ENDPOINTS=127.0.0.1:9000 \
+P2PRIG_BATCH=100000 \
+./xmrig -a rx --bench=200K -c ./config.loopback.json --http-host=127.0.0.1 --http-port=8082
+```
+
+### HTTP API additions
+
+The miner summary (`GET /2/summary`) includes a new `peer_server` object:
+
+```json
+"peer_server": {
+  "enabled": true,
+  "bind": "127.0.0.1",
+  "port": 9000,
+  "connections": 0
+}
+```
+
+Remote backend details appear in `GET /2/backends` under `type: "remote"`, including connection status, per-remote metadata, and batch sizing. When `P2PRIG_*` variables are not set, the remote backend remains disabled.
+
+### Notes
+
+- RandomX huge pages (including 1 GB if available) significantly improve performance.
+- The PeerServer reports a running connection counter; it may represent total accepts rather than current live connections depending on your version.
+- The protocol is evolving; current implementation supports handshake, `JOB_SUBMIT` (XJ), slice lease (XL), `RESULT`, `DONE`, `SLICE_DONE_EXT`, and `JOB_ABORT`.

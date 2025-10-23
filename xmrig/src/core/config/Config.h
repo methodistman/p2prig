@@ -46,6 +46,11 @@ public:
 
     static const char *kPauseOnBattery;
     static const char *kPauseOnActive;
+    static const char *kPeer;             // "peer"
+    static const char *kPeerEnabled;      // "enabled"
+    static const char *kPeerBind;         // "bind"
+    static const char *kPeerPort;         // "port"
+    static const char *kPeerToken;        // "token"
 
 #   ifdef XMRIG_FEATURE_OPENCL
     static const char *kOcl;
@@ -71,6 +76,12 @@ public:
     bool isPauseOnBattery() const;
     const CpuConfig &cpu() const;
     uint32_t idleTime() const;
+
+    // Peer accessors
+    bool peerEnabled() const;
+    const char *peerBind() const; // default "127.0.0.1"
+    uint16_t peerPort() const;    // default 9000
+    const char *peerToken() const;
 
 #   ifdef XMRIG_FEATURE_OPENCL
     const OclConfig &cl() const;

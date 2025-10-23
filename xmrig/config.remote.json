@@ -1,0 +1,8 @@
+{
+  "autosave": false,
+  "cpu": { "enabled": false },
+  "http": { "enabled": true, "host": "127.0.0.1", "port": 8081 },
+  "pools": [
+    { "url": "donate.v2.xmrig.com:443", "user": "donate", "pass": "x", "keepalive": true, "tls": true }
+  ]
+}

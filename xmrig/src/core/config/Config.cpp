@@ -54,6 +54,11 @@ constexpr static uint32_t kIdleTime     = 60U;
 
 const char *Config::kPauseOnBattery     = "pause-on-battery";
 const char *Config::kPauseOnActive      = "pause-on-active";
+const char *Config::kPeer               = "peer";
+const char *Config::kPeerEnabled        = "enabled";
+const char *Config::kPeerBind           = "bind";
+const char *Config::kPeerPort           = "port";
+const char *Config::kPeerToken          = "token";
 
 
 #ifdef XMRIG_FEATURE_OPENCL
@@ -79,6 +84,12 @@ public:
     bool pauseOnBattery = false;
     CpuConfig cpu;
     uint32_t idleTime   = 0;
+
+    // peer
+    bool peerEnabled = false;
+    String peerBind = String("127.0.0.1");
+    uint16_t peerPort = 9000;
+    String peerToken;
 
 #   ifdef XMRIG_ALGO_RANDOMX
     RxConfig rx;
@@ -141,6 +152,30 @@ const xmrig::CpuConfig &xmrig::Config::cpu() const
 uint32_t xmrig::Config::idleTime() const
 {
     return d_ptr->idleTime * 1000U;
+}
+
+
+bool xmrig::Config::peerEnabled() const
+{
+    return d_ptr->peerEnabled;
+}
+
+
+const char *xmrig::Config::peerBind() const
+{
+    return d_ptr->peerBind.isNull() ? "127.0.0.1" : d_ptr->peerBind.data();
+}
+
+
+uint16_t xmrig::Config::peerPort() const
+{
+    return d_ptr->peerPort;
+}
+
+
+const char *xmrig::Config::peerToken() const
+{
+    return d_ptr->peerToken.isNull() ? nullptr : d_ptr->peerToken.data();
 }
 
 
@@ -243,6 +278,23 @@ bool xmrig::Config::read(const IJsonReader &reader, const char *fileName)
     d_ptr->dmi = reader.getBool(kDMI, d_ptr->dmi);
 #   endif
 
+    // peer section (optional)
+    const auto &peer = reader.getValue(kPeer);
+    if (peer.IsObject()) {
+        if (peer.HasMember(kPeerEnabled) && peer[kPeerEnabled].IsBool()) {
+            d_ptr->peerEnabled = peer[kPeerEnabled].GetBool();
+        }
+        if (peer.HasMember(kPeerBind) && peer[kPeerBind].IsString()) {
+            d_ptr->peerBind = String(peer[kPeerBind]);
+        }
+        if (peer.HasMember(kPeerPort) && peer[kPeerPort].IsUint()) {
+            d_ptr->peerPort = static_cast<uint16_t>(peer[kPeerPort].GetUint());
+        }
+        if (peer.HasMember(kPeerToken) && peer[kPeerToken].IsString()) {
+            d_ptr->peerToken = String(peer[kPeerToken]);
+        }
+    }
+
     return true;
 }
 
@@ -305,4 +357,16 @@ void xmrig::Config::getJSON(rapidjson::Document &doc) const
     doc.AddMember(StringRef(kWatch),                    m_watch, allocator);
     doc.AddMember(StringRef(kPauseOnBattery),           isPauseOnBattery(), allocator);
     doc.AddMember(StringRef(kPauseOnActive),            (d_ptr->idleTime == 0U || d_ptr->idleTime == kIdleTime) ? Value(isPauseOnActive()) : Value(d_ptr->idleTime), allocator);
+
+    // peer
+    {
+        Value peer(kObjectType);
+        peer.AddMember(StringRef(kPeerEnabled), Value(peerEnabled()), allocator);
+        peer.AddMember(StringRef(kPeerBind),    StringRef(peerBind()), allocator);
+        peer.AddMember(StringRef(kPeerPort),    Value(peerPort()), allocator);
+        if (peerToken() != nullptr) {
+            peer.AddMember(StringRef(kPeerToken), StringRef(peerToken()), allocator);
+        }
+        doc.AddMember(StringRef(kPeer), peer, allocator);
+    }
 }
